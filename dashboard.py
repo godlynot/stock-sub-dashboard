@@ -1,11 +1,12 @@
 """
-Flask dashboard for stock-subreddit data.
+Stock Sub Dashboard - Flask web service.
 
-Reads from a SQLite DB populated by data_fetcher.py. Shows:
-  - Top tickers by mentions per subreddit (with 24h delta)
-  - Trending tickers (mentions surge)
-  - Top recent posts per subreddit
-  - Cross-subreddit leaderboard
+Calls free public APIs (ApeWisdom for ticker rankings, Arctic Shift for post
+content) directly at request time. Caches results in memory for CACHE_TTL
+seconds to avoid hammering the free APIs.
+
+No database, no disk, no cron — just a single Flask app that fits on Render's
+free tier (no persistent disk required, so deploys/restarts don't lose state).
 
 Run:
   python dashboard.py            # dev server on :5000
@@ -13,235 +14,376 @@ Run:
 """
 
 import os
-import sqlite3
+import threading
+import time
 from datetime import datetime, timezone
-from pathlib import Path
+from typing import Any
 
-from flask import Flask, g, jsonify, render_template_string, request
+import requests
+from flask import Flask, jsonify, render_template_string, request
 
-from data_fetcher import DB_PATH, init_db
+# ----------------------------------------------------------------------------
+# Config
+# ----------------------------------------------------------------------------
 
-app = Flask(__name__)
+CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))  # 1 hour
+APEWISDOM_TIMEOUT = int(os.getenv("APEWISDOM_TIMEOUT", "20"))
+ARCTIC_TIMEOUT = int(os.getenv("ARCTIC_TIMEOUT", "30"))
+POSTS_PER_SUB = int(os.getenv("POSTS_PER_SUB", "30"))
+POST_LOOKBACK_DAYS = int(os.getenv("POST_LOOKBACK_DAYS", "7"))
+
+# Subreddits we track. ApeWisdom covers all of these with rankings.
+# Arctic Shift has good coverage for all except r/wallstreetbets (sparse).
+DEFAULT_SUBS = [
+    "wallstreetbets",
+    "stocks",
+    "investing",
+    "options",
+    "StockMarket",
+    "pennystocks",
+    "SPACs",
+]
+
+SUBS = [
+    s.strip()
+    for s in os.getenv("SUBS", ",".join(DEFAULT_SUBS)).split(",")
+    if s.strip()
+]
+
+# Subs we fetch post content for. WSB omitted — Arctic Shift has sparse WSB data.
+POST_SUBS = [
+    s.strip()
+    for s in os.getenv("POST_SUBS", "stocks,investing,options,StockMarket,pennystocks,SPACs").split(",")
+    if s.strip()
+]
+
+# ----------------------------------------------------------------------------
+# HTTP clients
+# ----------------------------------------------------------------------------
+
+HEADERS = {
+    "User-Agent": "stock-sub-dashboard/1.0 (free; non-commercial)",
+    "Accept": "application/json",
+}
+
+_session = requests.Session()
+_session.headers.update(HEADERS)
+
+
+def _get_json(url: str, params: dict | None = None, timeout: int = 20) -> dict | None:
+    try:
+        resp = _session.get(url, params=params, timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        print(f"[api] error fetching {url}: {e}", flush=True)
+        return None
 
 
 # ----------------------------------------------------------------------------
-# DB helpers
+# API fetchers (no DB, no auth)
 # ----------------------------------------------------------------------------
 
-def get_db() -> sqlite3.Connection:
-    db = getattr(g, "_db", None)
-    if db is None:
-        db = init_db()
-        g._db = db
-    return db
-
-
-@app.teardown_appcontext
-def close_db(_exc):
-    db = getattr(g, "_db", None)
-    if db is not None:
-        db.close()
-
-
-def query_dicts(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> list[dict]:
-    cur = conn.execute(sql, params)
-    cols = [c[0] for c in cur.description]
-    return [dict(zip(cols, row)) for row in cur.fetchall()]
-
-
-# ----------------------------------------------------------------------------
-# Aggregations
-# ----------------------------------------------------------------------------
-
-def _latest_snapshot_filter(alias: str = "ts") -> str:
-    """SQL fragment: only rows from the most recent snapshot per subreddit.
-    The alias must match the FROM clause alias of the ticker_snapshots table."""
-    return f"""
-        {alias}.source = 'apewisdom'
-        AND {alias}.snapshot_at = (
-            SELECT MAX(snapshot_at) FROM ticker_snapshots
-            WHERE subreddit = {alias}.subreddit AND source = 'apewisdom'
-        )
+def fetch_apewisdom_tickers() -> dict[str, list[dict]]:
     """
+    Fetch ticker rankings for all configured subs.
+    Returns {subreddit: [ticker_dict, ...]}.
+    """
+    out: dict[str, list[dict]] = {}
+    for sub in SUBS:
+        url = f"https://apewisdom.io/api/v1.0/filter/{sub}/page/1"
+        data = _get_json(url, timeout=APEWISDOM_TIMEOUT)
+        if data and isinstance(data, dict):
+            out[sub] = data.get("results", [])
+        else:
+            out[sub] = []
+        time.sleep(0.3)  # be polite
+    return out
+
+
+def fetch_arctic_posts(sub: str) -> list[dict]:
+    """Fetch recent top posts for one subreddit from Arctic Shift."""
+    now = int(time.time())
+    after = now - POST_LOOKBACK_DAYS * 86400
+    url = "https://arctic-shift.photon-reddit.com/api/posts/search"
+    params = {
+        "subreddit": sub,
+        "limit": 100,
+        "after": after,
+        "sort": "desc",
+    }
+    data = _get_json(url, params=params, timeout=ARCTIC_TIMEOUT)
+    if not data or "data" not in data:
+        return []
+    # Sort by score client-side (Arctic Shift doesn't support sort=score)
+    posts = data["data"]
+    posts.sort(key=lambda p: p.get("score", 0), reverse=True)
+    return posts[:POSTS_PER_SUB]
+
+
+def fetch_all_arctic_posts() -> dict[str, list[dict]]:
+    """Fetch posts for all configured POST_SUBS."""
+    out: dict[str, list[dict]] = {}
+    for sub in POST_SUBS:
+        out[sub] = fetch_arctic_posts(sub)
+        time.sleep(0.5)
+    return out
 
 
 # ----------------------------------------------------------------------------
-# API endpoints
+# In-memory cache
 # ----------------------------------------------------------------------------
 
-@app.route("/api/stats")
-def api_stats():
-    """Main dashboard payload."""
-    conn = get_db()
+class Cache:
+    """Thread-safe in-memory cache with TTL."""
 
-    # 1. Last fetch time + per-subreddit freshness
-    freshness = query_dicts(conn, """
-        SELECT subreddit, MAX(finished_at) AS last_fetch,
-               SUM(records) AS total_records
-        FROM fetch_log
-        WHERE error IS NULL OR error = ''
-        GROUP BY subreddit
-        ORDER BY subreddit
-    """)
-    last_scrape_iso = None
-    for f in freshness:
-        if f["last_fetch"] and (last_scrape_iso is None or f["last_fetch"] > last_scrape_iso):
-            last_scrape_iso = f["last_fetch"]
+    def __init__(self, ttl: int):
+        self.ttl = ttl
+        self._data: Any = None
+        self._fetched_at: float = 0
+        self._lock = threading.Lock()
+        self._fetching = False
 
-    # 2. Cross-sub leaderboard (latest snapshot, sum mentions across subs)
-    cross_sub = query_dicts(conn, f"""
-        SELECT ts.ticker, MAX(ts.name) AS name,
-               SUM(ts.mentions) AS total_mentions,
-               SUM(ts.upvotes) AS total_upvotes,
-               COUNT(*) AS sub_count,
-               GROUP_CONCAT(DISTINCT ts.subreddit) AS subs
-        FROM ticker_snapshots ts
-        WHERE {_latest_snapshot_filter('ts')}
-        GROUP BY ts.ticker
-        HAVING total_mentions >= 5
-        ORDER BY total_mentions DESC
-        LIMIT 30
-    """)
+    def get(self, fetch_fn) -> Any:
+        now = time.time()
+        with self._lock:
+            if self._data is not None and (now - self._fetched_at) < self.ttl:
+                return self._data
+            if self._fetching:
+                # Another thread is fetching; return stale or empty
+                return self._data or {}
+            self._fetching = True
 
-    # 3. Trending — biggest gainers vs ~24h ago (compare latest snapshot to previous-day)
-    trending = query_dicts(conn, """
-        WITH latest AS (
-            SELECT * FROM ticker_snapshots ts_latest
-            WHERE ts_latest.source = 'apewisdom'
-              AND ts_latest.snapshot_at = (
-                  SELECT MAX(snapshot_at) FROM ticker_snapshots
-                  WHERE subreddit = ts_latest.subreddit AND source = 'apewisdom'
-              )
-        ),
-        older AS (
-            SELECT * FROM ticker_snapshots ts_older
-            WHERE ts_older.source = 'apewisdom'
-              AND ts_older.snapshot_at = (
-                  SELECT MAX(snapshot_at) FROM ticker_snapshots
-                  WHERE subreddit = ts_older.subreddit
-                    AND source = 'apewisdom'
-                    AND snapshot_at < (
-                        SELECT MAX(snapshot_at) FROM ticker_snapshots
-                        WHERE subreddit = ts_older.subreddit AND source = 'apewisdom'
-                    )
-              )
-        )
-        SELECT l.ticker, MAX(l.name) AS name,
-               SUM(l.mentions) AS mentions_now,
-               COALESCE(SUM(o.mentions), 0) AS mentions_24h,
-               (SUM(l.mentions) - COALESCE(SUM(o.mentions), 0)) AS delta
-        FROM latest l
-        LEFT JOIN older o ON o.ticker = l.ticker AND o.subreddit = l.subreddit
-        GROUP BY l.ticker
-        HAVING mentions_now >= 3
-        ORDER BY delta DESC
-        LIMIT 15
-    """)
+        # Fetch outside the lock so concurrent requests don't block on each other
+        try:
+            print(f"[cache] refreshing (age={now - self._fetched_at:.0f}s)...", flush=True)
+            fresh = fetch_fn()
+            with self._lock:
+                self._data = fresh
+                self._fetched_at = time.time()
+            return fresh
+        finally:
+            with self._lock:
+                self._fetching = False
 
-    # 4. Per-subreddit top tickers
-    per_sub_top = {}
-    for row in query_dicts(conn, f"""
-        SELECT subreddit, ticker, name, mentions, upvotes,
-               rank_24h_ago, mentions_24h_ago
-        FROM ticker_snapshots ts
-        WHERE {_latest_snapshot_filter('ts')}
-        ORDER BY subreddit, mentions DESC
-    """):
-        per_sub_top.setdefault(row["subreddit"], []).append(row)
-    # Trim to top 10 per sub
-    per_sub_top = {k: v[:10] for k, v in per_sub_top.items()}
 
-    # 5. Top recent posts across all subs
-    top_posts = query_dicts(conn, """
-        SELECT id, subreddit, title, author, score, num_comments,
-               permalink, upvote_ratio, created_utc
-        FROM posts
-        WHERE score > 5
-        ORDER BY score DESC
-        LIMIT 30
-    """)
+# ----------------------------------------------------------------------------
+# Aggregation (build dashboard payload from raw API data)
+# ----------------------------------------------------------------------------
 
-    # 6. Per-subreddit post summary
-    per_sub_posts = query_dicts(conn, """
-        SELECT subreddit,
-               COUNT(*) AS posts,
-               AVG(score) AS avg_score,
-               SUM(num_comments) AS total_comments,
-               MAX(score) AS top_score
-        FROM posts
-        GROUP BY subreddit
-        ORDER BY total_comments DESC
-    """)
+def build_dashboard_payload() -> dict:
+    """Fetch everything and shape it for the dashboard."""
+    started = time.time()
+    tickers_by_sub = fetch_apewisdom_tickers()
+    posts_by_sub = fetch_all_arctic_posts()
+    elapsed = time.time() - started
 
-    return jsonify({
-        "last_scrape": last_scrape_iso,
+    # Flatten posts across subs, sort by score
+    all_posts = []
+    for sub, posts in posts_by_sub.items():
+        for p in posts:
+            all_posts.append({
+                "id": p.get("id", ""),
+                "subreddit": p.get("subreddit", sub),
+                "title": (p.get("title") or "")[:500],
+                "author": p.get("author", "[deleted]"),
+                "score": p.get("score", 0),
+                "num_comments": p.get("num_comments", 0),
+                "upvote_ratio": p.get("upvote_ratio"),
+                "permalink": f"https://reddit.com{p.get('permalink', '')}",
+                "created_utc": p.get("created_utc"),
+            })
+    all_posts.sort(key=lambda p: p["score"], reverse=True)
+    top_posts = [p for p in all_posts if p["score"] > 5][:30]
+
+    # Per-sub top tickers (top 10 each, by mentions)
+    per_sub_top: dict[str, list[dict]] = {}
+    for sub, tickers in tickers_by_sub.items():
+        ranked = sorted(tickers, key=lambda t: t.get("mentions", 0), reverse=True)[:10]
+        per_sub_top[sub] = ranked
+
+    # Cross-sub leaderboard: sum mentions across all subs
+    cross_sub: dict[str, dict] = {}
+    for sub, tickers in tickers_by_sub.items():
+        for t in tickers:
+            sym = t.get("ticker")
+            if not sym:
+                continue
+            if sym not in cross_sub:
+                cross_sub[sym] = {
+                    "ticker": sym,
+                    "name": t.get("name", ""),
+                    "total_mentions": 0,
+                    "total_upvotes": 0,
+                    "sub_count": 0,
+                    "subs": [],
+                }
+            cross_sub[sym]["total_mentions"] += t.get("mentions", 0) or 0
+            cross_sub[sym]["total_upvotes"] += t.get("upvotes", 0) or 0
+            cross_sub[sym]["sub_count"] += 1
+            cross_sub[sym]["subs"].append(sub)
+    # Filter low-volume and sort
+    cross_sub_list = [v for v in cross_sub.values() if v["total_mentions"] >= 5]
+    cross_sub_list.sort(key=lambda v: v["total_mentions"], reverse=True)
+    cross_sub_list = cross_sub_list[:30]
+
+    # Trending — biggest mention_delta from ApeWisdom (computed for us)
+    trending_data: dict[str, dict] = {}
+    for sub, tickers in tickers_by_sub.items():
+        for t in tickers:
+            sym = t.get("ticker")
+            m24 = t.get("mentions_24h_ago")
+            if not sym or m24 is None:
+                continue
+            if sym not in trending_data:
+                trending_data[sym] = {
+                    "ticker": sym,
+                    "name": t.get("name", ""),
+                    "mentions_now": 0,
+                    "mentions_24h": 0,
+                }
+            trending_data[sym]["mentions_now"] += t.get("mentions", 0) or 0
+            trending_data[sym]["mentions_24h"] += m24 or 0
+    trending_list = []
+    for v in trending_data.values():
+        delta = v["mentions_now"] - v["mentions_24h"]
+        if v["mentions_now"] >= 3:
+            v["delta"] = delta
+            trending_list.append(v)
+    trending_list.sort(key=lambda v: v["delta"], reverse=True)
+    trending_list = trending_list[:15]
+
+    # Per-subreddit post summary
+    per_sub_posts = []
+    for sub, posts in posts_by_sub.items():
+        if not posts:
+            continue
+        per_sub_posts.append({
+            "subreddit": sub,
+            "posts": len(posts),
+            "total_comments": sum(p.get("num_comments", 0) for p in posts),
+            "avg_score": sum(p.get("score", 0) for p in posts) / max(len(posts), 1),
+            "top_score": max((p.get("score", 0) for p in posts), default=0),
+        })
+    per_sub_posts.sort(key=lambda s: s["total_comments"], reverse=True)
+
+    # Freshness
+    freshness = [
+        {
+            "subreddit": sub,
+            "last_fetch": datetime.now(timezone.utc).isoformat(),
+            "total_records": len(tickers_by_sub.get(sub, [])) + len(posts_by_sub.get(sub, [])),
+        }
+        for sub in set(list(tickers_by_sub.keys()) + list(posts_by_sub.keys()))
+    ]
+
+    return {
+        "last_scrape": datetime.now(timezone.utc).isoformat(),
+        "fetch_time_seconds": round(elapsed, 1),
         "freshness": freshness,
-        "cross_sub_leaderboard": cross_sub,
-        "trending": trending,
+        "cross_sub_leaderboard": cross_sub_list,
+        "trending": trending_list,
         "per_sub_top": per_sub_top,
         "top_posts": top_posts,
         "per_sub_posts": per_sub_posts,
-    })
+    }
+
+
+def build_ticker_detail(ticker: str) -> dict:
+    """Build a per-ticker detail payload by searching current snapshots."""
+    upper = ticker.upper().lstrip("$")
+    tickers_by_sub = fetch_apewisdom_tickers()
+    posts_by_sub = fetch_all_arctic_posts()
+
+    # Per-sub stats
+    latest = []
+    for sub, tickers in tickers_by_sub.items():
+        for t in tickers:
+            if t.get("ticker") == upper:
+                latest.append({
+                    "subreddit": sub,
+                    "rank": t.get("rank"),
+                    "mentions": t.get("mentions"),
+                    "upvotes": t.get("upvotes"),
+                    "mentions_24h_ago": t.get("mentions_24h_ago"),
+                    "rank_24h_ago": t.get("rank_24h_ago"),
+                })
+                break
+
+    # Posts mentioning this ticker
+    posts = []
+    for sub, plist in posts_by_sub.items():
+        for p in plist:
+            title = (p.get("title") or "")
+            if upper in title.upper() or f"${upper}" in title.upper():
+                posts.append({
+                    "id": p.get("id"),
+                    "subreddit": p.get("subreddit", sub),
+                    "title": title,
+                    "score": p.get("score", 0),
+                    "num_comments": p.get("num_comments", 0),
+                    "permalink": f"https://reddit.com{p.get('permalink', '')}",
+                    "author": p.get("author"),
+                })
+    posts.sort(key=lambda p: p["score"], reverse=True)
+    posts = posts[:30]
+
+    return {
+        "ticker": upper,
+        "latest_per_sub": sorted(latest, key=lambda x: x.get("mentions", 0) or 0, reverse=True),
+        "recent_posts": posts[:30],
+        # 7-day trend unavailable in this stateless design (would need a DB)
+        "trend_7d": [],
+    }
+
+
+# ----------------------------------------------------------------------------
+# App + cache
+# ----------------------------------------------------------------------------
+
+app = Flask(__name__)
+cache = Cache(ttl=CACHE_TTL)
+
+
+@app.route("/api/stats")
+def api_stats():
+    """Main dashboard payload. Cached for CACHE_TTL seconds."""
+    try:
+        data = cache.get(build_dashboard_payload)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/ticker/<ticker>")
 def api_ticker_detail(ticker: str):
-    """Show all info for one ticker across subs."""
-    conn = get_db()
-    upper = ticker.upper().lstrip("$")
-
-    # Latest snapshot for this ticker
-    latest = query_dicts(conn, f"""
-        SELECT ts.* FROM ticker_snapshots ts
-        WHERE ts.ticker = ? AND {_latest_snapshot_filter('ts')}
-        ORDER BY ts.mentions DESC
-    """, (upper,))
-
-    # Trend over the last 7 days (if we have that many snapshots)
-    trend = query_dicts(conn, """
-        SELECT DATE(snapshot_at) AS day, SUM(mentions) AS mentions, SUM(upvotes) AS upvotes
-        FROM ticker_snapshots
-        WHERE ticker = ? AND snapshot_at >= datetime('now', '-7 days')
-        GROUP BY DATE(snapshot_at)
-        ORDER BY day
-    """, (upper,))
-
-    # Recent posts with this ticker in title
-    posts = query_dicts(conn, """
-        SELECT id, subreddit, title, score, num_comments, permalink, author
-        FROM posts
-        WHERE (UPPER(title) LIKE ? OR UPPER(title) LIKE ?)
-        ORDER BY score DESC
-        LIMIT 30
-    """, (f"%{upper}%", f"%${upper}%"))
-
-    return jsonify({
-        "ticker": upper,
-        "latest_per_sub": latest,
-        "trend_7d": trend,
-        "recent_posts": posts,
-    })
+    """Ticker detail. Not cached (per-ticker lookups are cheap)."""
+    try:
+        return jsonify(build_ticker_detail(ticker))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/scrape-now", methods=["POST"])
-def api_scrape_now():
-    """Trigger a refresh (admin endpoint, requires SCRAPE_TOKEN)."""
-    token = os.getenv("SCRAPE_TOKEN", "")
-    if token and request.headers.get("X-Scrape-Token") != token:
-        return jsonify({"error": "unauthorized"}), 401
-    import threading
-    from data_fetcher import main as run_fetch
-    def _go():
-        try:
-            run_fetch()
-        except Exception as e:
-            print(f"[scrape-now error] {e}", flush=True)
-    threading.Thread(target=_go, daemon=True).start()
-    return jsonify({"status": "started"})
+@app.route("/health")
+def health():
+    """Health check for Render."""
+    return jsonify({"status": "ok", "cache_age_seconds": int(time.time() - cache._fetched_at) if cache._data else None})
+
+
+@app.route("/api/refresh", methods=["POST"])
+def api_refresh():
+    """Force-refresh the cache. Useful for debugging."""
+    try:
+        data = build_dashboard_payload()
+        cache._data = data
+        cache._fetched_at = time.time()
+        return jsonify({"status": "refreshed", "fetch_time_seconds": data.get("fetch_time_seconds")})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ----------------------------------------------------------------------------
-# HTML template (mobile-friendly)
+# HTML template (mobile-friendly, same as before)
 # ----------------------------------------------------------------------------
 
 TEMPLATE = r"""
@@ -301,7 +443,6 @@ TEMPLATE = r"""
   .row .val { color: var(--accent); font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
   .delta-up { color: var(--green); font-size: 11px; }
   .delta-down { color: var(--red); font-size: 11px; }
-  .sub-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
   .chip { background: var(--panel-2); border: 1px solid var(--border); padding: 4px 10px; border-radius: 12px; font-size: 11px; color: var(--muted); }
   .chip strong { color: var(--text); }
   .post { padding: 12px 0; border-bottom: 1px solid var(--border); }
@@ -338,8 +479,7 @@ TEMPLATE = r"""
   .stat-line { display: flex; justify-content: space-between; padding: 4px 0; font-size: 13px; }
   .stat-line .lbl { color: var(--muted); }
   .stat-line .val { color: var(--text); font-weight: 500; }
-  .trend-bar { display: flex; align-items: flex-end; gap: 4px; height: 60px; margin: 12px 0; }
-  .trend-bar .bar { flex: 1; background: var(--accent); border-radius: 3px 3px 0 0; min-height: 2px; transition: height 0.3s; }
+  .notice { background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; margin-bottom: 14px; font-size: 12px; color: var(--muted); }
 </style>
 </head>
 <body>
@@ -347,11 +487,12 @@ TEMPLATE = r"""
   <h1>📈 Stock Sub Dashboard</h1>
   <div class="subtitle">
     <span id="last-scrape">Loading...</span>
-    <button class="refresh-btn" onclick="loadData()">↻ Refresh</button>
+    <button class="refresh-btn" onclick="loadData(true)">↻ Refresh</button>
   </div>
 </header>
 
 <main>
+  <div id="notice-area"></div>
   <div class="grid" id="dashboard">
     <div class="loading">Loading dashboard data...</div>
   </div>
@@ -365,20 +506,29 @@ TEMPLATE = r"""
 </div>
 
 <div class="footer">
-  Data: ApeWisdom (ticker rankings) + Arctic Shift (post archive). Not financial advice.
+  Data: ApeWisdom + Arctic Shift. Cached for 1 hour. Not financial advice.
 </div>
 
 <script>
 let dashboardData = null;
 
-async function loadData() {
+async function loadData(force = false) {
+  const dash = document.getElementById('dashboard');
+  if (force) {
+    dash.innerHTML = '<div class="loading">Refreshing (this can take ~30s on cold cache)...</div>';
+  }
   try {
-    const resp = await fetch('/api/stats');
+    const url = force ? '/api/refresh' : '/api/stats';
+    const opts = force ? { method: 'POST' } : {};
+    const resp = await fetch(url, opts);
     dashboardData = await resp.json();
+    if (dashboardData.error) {
+      dash.innerHTML = `<div class="card"><div class="empty">Error: ${escapeHtml(dashboardData.error)}</div></div>`;
+      return;
+    }
     render(dashboardData);
   } catch (e) {
-    document.getElementById('dashboard').innerHTML =
-      '<div class="card"><div class="empty">Error loading data. Check server logs.</div></div>';
+    dash.innerHTML = '<div class="card"><div class="empty">Error loading data.</div></div>';
   }
 }
 
@@ -386,13 +536,30 @@ function render(d) {
   const lastScrape = d.last_scrape
     ? new Date(d.last_scrape).toLocaleString()
     : 'Never';
-  document.getElementById('last-scrape').textContent = `Last update: ${lastScrape}`;
+  const age = d.last_scrape
+    ? Math.round((Date.now() - new Date(d.last_scrape).getTime()) / 1000 / 60)
+    : null;
+  let ageStr = '';
+  if (age !== null) {
+    if (age < 1) ageStr = ' (just now)';
+    else if (age < 60) ageStr = ` (${age}m ago)`;
+    else ageStr = ` (${Math.round(age/60)}h ago)`;
+  }
+  document.getElementById('last-scrape').textContent = `Updated: ${lastScrape}${ageStr}`;
+
+  // Notice for first cold load
+  const noticeArea = document.getElementById('notice-area');
+  if (d.fetch_time_seconds && d.fetch_time_seconds > 5) {
+    noticeArea.innerHTML = `<div class="notice">Cold cache refresh took ${d.fetch_time_seconds}s. Future loads will be instant (cached for 1h).</div>`;
+  } else {
+    noticeArea.innerHTML = '';
+  }
 
   const html = `
     <div class="card">
       <h2>🔥 Trending (mentions Δ vs 24h)</h2>
       ${d.trending.length === 0
-        ? '<div class="empty">Need more data to compute trends.</div>'
+        ? '<div class="empty">No trending data yet.</div>'
         : d.trending.slice(0, 12).map(t => `
             <div class="row">
               <span class="lbl">
@@ -413,7 +580,7 @@ function render(d) {
     </div>
 
     <div class="card">
-      <h2>🏆 Cross-Sub Leaderboard (latest)</h2>
+      <h2>🏆 Cross-Sub Leaderboard</h2>
       ${d.cross_sub_leaderboard.length === 0
         ? '<div class="empty">No data yet.</div>'
         : d.cross_sub_leaderboard.slice(0, 12).map(t => `
@@ -476,19 +643,6 @@ function render(d) {
     </div>
 
     <div class="card">
-      <h2>📡 Data Freshness</h2>
-      ${d.freshness.length === 0
-        ? '<div class="empty">No fetches yet.</div>'
-        : d.freshness.map(f => `
-            <div class="stat-line">
-              <span class="lbl">r/${f.subreddit}</span>
-              <span class="val">${f.total_records} records · ${timeAgo(f.last_fetch)}</span>
-            </div>
-          `).join('')
-      }
-    </div>
-
-    <div class="card">
       <h2>💬 Sub Activity</h2>
       ${d.per_sub_posts.length === 0
         ? '<div class="empty">No posts yet.</div>'
@@ -512,42 +666,28 @@ function escapeHtml(s) {
   }[c]));
 }
 
-function timeAgo(iso) {
-  if (!iso) return '?';
-  const ms = Date.now() - new Date(iso).getTime();
-  const min = Math.floor(ms / 60000);
-  if (min < 1) return 'just now';
-  if (min < 60) return `${min}m ago`;
-  const hr = Math.floor(min / 60);
-  if (hr < 24) return `${hr}h ago`;
-  const d = Math.floor(hr / 24);
-  return `${d}d ago`;
-}
-
 async function openTicker(ticker) {
   const modal = document.getElementById('modal');
-  document.getElementById('modal-body').innerHTML =
-    '<div class="loading">Loading...</div>';
+  document.getElementById('modal-body').innerHTML = '<div class="loading">Loading...</div>';
   modal.classList.add('active');
-
   try {
     const resp = await fetch(`/api/ticker/${encodeURIComponent(ticker)}`);
     const data = await resp.json();
+    if (data.error) {
+      document.getElementById('modal-body').innerHTML = `<div class="empty">${escapeHtml(data.error)}</div>`;
+      return;
+    }
     document.getElementById('modal-body').innerHTML = renderTickerModal(data);
   } catch (e) {
-    document.getElementById('modal-body').innerHTML =
-      '<div class="empty">Error loading.</div>';
+    document.getElementById('modal-body').innerHTML = '<div class="empty">Error loading.</div>';
   }
 }
 
 function renderTickerModal(data) {
   const latest = data.latest_per_sub;
-  const trend = data.trend_7d;
   const posts = data.recent_posts;
-
   let html = `<h2 style="margin-top:0;">$${data.ticker}</h2>`;
 
-  // Per-sub stats
   if (latest.length > 0) {
     html += `<div style="margin-top:14px;"><strong style="color:var(--muted);font-size:12px;text-transform:uppercase;">By Subreddit (latest)</strong>`;
     latest.forEach(l => {
@@ -571,23 +711,6 @@ function renderTickerModal(data) {
     html += `</div>`;
   }
 
-  // 7-day trend bar chart
-  if (trend.length > 1) {
-    const maxM = Math.max(...trend.map(t => t.mentions || 0));
-    html += `<div style="margin-top:14px;"><strong style="color:var(--muted);font-size:12px;text-transform:uppercase;">7-day mentions</strong>`;
-    html += `<div class="trend-bar">`;
-    trend.forEach(t => {
-      const h = maxM > 0 ? (t.mentions / maxM) * 100 : 0;
-      html += `<div class="bar" style="height:${h}%" title="${t.day}: ${t.mentions}"></div>`;
-    });
-    html += `</div>`;
-    html += `<div style="display:flex;justify-content:space-between;font-size:10px;color:var(--muted);">
-      <span>${trend[0].day}</span>
-      <span>${trend[trend.length-1].day}</span>
-    </div></div>`;
-  }
-
-  // Recent posts
   if (posts.length > 0) {
     html += `<div style="margin-top:14px;"><strong style="color:var(--muted);font-size:12px;text-transform:uppercase;">Recent Posts (${posts.length})</strong>`;
     posts.slice(0, 10).forEach(p => {
@@ -608,9 +731,8 @@ function renderTickerModal(data) {
   }
 
   if (latest.length === 0 && posts.length === 0) {
-    html += '<div class="empty">No data for this ticker.</div>';
+    html += '<div class="empty">No data for this ticker right now.</div>';
   }
-
   return html;
 }
 
@@ -619,7 +741,6 @@ function closeModal() {
 }
 
 loadData();
-setInterval(loadData, 5 * 60 * 1000);
 </script>
 </body>
 </html>
@@ -637,4 +758,5 @@ def index():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
+    # threaded=True so multiple users can hit /api/stats simultaneously
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)

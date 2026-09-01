@@ -9,44 +9,13 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
-      - key: APEWISDOM_SUBS
+      - key: SUBS
         value: "wallstreetbets,stocks,investing,options,StockMarket,pennystocks,SPACs"
-      - key: ARCTIC_SUBS
+      - key: POST_SUBS
         value: "stocks,investing,options,StockMarket,pennystocks,SPACs"
-      - key: PAGES_PER_SUB
-        value: "1"
+      - key: CACHE_TTL
+        value: "3600"
       - key: POSTS_PER_SUB
         value: "30"
       - key: POST_LOOKBACK_DAYS
         value: "7"
-      - key: SCRAPE_TOKEN
-        generateValue: true
-    disk:
-      name: stock-sub-data
-      mountPath: /opt/render/project/src/data
-      sizeGB: 1
-
-  - type: cron
-    name: weekly-scrape
-    runtime: python
-    plan: free
-    schedule: "0 0 * * 0"  # Every Sunday at midnight UTC
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "python data_fetcher.py"
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.9
-      - key: APEWISDOM_SUBS
-        value: "wallstreetbets,stocks,investing,options,StockMarket,pennystocks,SPACs"
-      - key: ARCTIC_SUBS
-        value: "stocks,investing,options,StockMarket,pennystocks,SPACs"
-      - key: PAGES_PER_SUB
-        value: "1"
-      - key: POSTS_PER_SUB
-        value: "30"
-      - key: POST_LOOKBACK_DAYS
-        value: "7"
-    disk:
-      name: stock-sub-data
-      mountPath: /opt/render/project/src/data
-      sizeGB: 1

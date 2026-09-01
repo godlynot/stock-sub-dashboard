@@ -1,16 +1,16 @@
 # Stock Sub Dashboard
 
-A mobile-friendly web dashboard that shows trending tickers and top posts from r/wallstreetbets and other stock subreddits. Data flows from two **free, no-auth** public APIs.
+A mobile-friendly web dashboard that shows trending tickers and top posts from r/wallstreetbets and other stock subreddits. Data comes from two **free, no-auth** public APIs.
 
 ## What you get
 
-- 📊 Trending tickers (mentions delta vs. previous snapshot)
+- 📊 Trending tickers (mentions delta vs. 24h ago)
 - 🏆 Cross-sub leaderboard (which tickers are being talked about everywhere)
 - 🔥 Per-subreddit top tickers (WSB, stocks, investing, options, StockMarket, pennystocks, SPACs)
 - 🌟 Top recent posts with score, comments, and links to Reddit
 - 📱 Mobile-friendly dark dashboard — open from your phone
 
-## Architecture
+## How it works
 
 ```
 ┌────────────────────┐    ┌─────────────────────┐
@@ -22,100 +22,74 @@ A mobile-friendly web dashboard that shows trending tickers and top posts from r
           └────────────┬────────────┘
                        ▼
               ┌─────────────────┐
-              │  data_fetcher.py │  ← weekly cron
-              │  (no auth!)      │
-              └────────┬────────┘
-                       ▼
-              ┌─────────────────┐
-              │  SQLite (local) │
-              │  data/dashboard.db│
-              └────────┬────────┘
-                       ▼
-              ┌─────────────────┐
-              │  dashboard.py    │  ← web service
-              │  (Flask, gunicorn)│
+              │   dashboard.py  │  ← single Flask app
+              │  (in-memory     │     (no DB needed)
+              │   cache 1h)     │
               └────────┬────────┘
                        ▼
                   Browser / Phone
 ```
 
-**Why no Reddit API?** Reddit now blocks anonymous JSON access from most IPs and requires you to register a script app + OAuth. Instead, we use two services that already do the hard work of mining Reddit:
+**Why no Reddit API?** Reddit now blocks anonymous JSON access from most IPs and requires OAuth. Instead, we use two services that already do the hard work of mining Reddit:
 
-- **ApeWisdom** (apewisdom.io) — a public service that has already done the ticker extraction for r/wallstreetbets and 100+ other stock subs. They expose a free JSON API with rankings + 24h deltas.
-- **Arctic Shift** (photon-reddit.com) — a Pushshift replacement that archives Reddit posts. We use it to fetch the actual post titles/links so the dashboard can link out.
+- **ApeWisdom** (apewisdom.io) — a public service that has already done ticker extraction for r/wallstreetbets and 100+ other stock subs. Free JSON API with rankings + 24h deltas.
+- **Arctic Shift** (photon-reddit.com) — a Pushshift replacement archiving Reddit posts. Free JSON API for post titles/links.
 
-This means: **no Reddit credentials, no auth dance, no rate-limit fights, fresh data.**
+The dashboard calls these directly at request time, with a 1-hour in-memory cache. **No database, no disk, no cron job needed** — fits on Render's free tier with no extra services.
 
 ## Local setup
 
 ```bash
-# Install
 pip install -r requirements.txt
-
-# (Optional) Run a one-time fetch to populate the DB
-python data_fetcher.py
-
-# Start dashboard at http://localhost:5000
 python dashboard.py
 ```
 
-Then open `http://localhost:5000` in your browser (or phone, if on same WiFi).
+Then open `http://localhost:5000` in your browser.
 
-### CLI usage
-
-```bash
-python data_fetcher.py                  # fetch from both sources
-python data_fetcher.py --source apewisdom  # only ticker rankings
-python data_fetcher.py --source arctic     # only post content
-python data_fetcher.py --sub wallstreetbets  # one subreddit
-python data_fetcher.py --stats          # DB summary
-python data_fetcher.py --ticker TSLA    # recent posts about a ticker
-```
+- First request takes ~10-30s (fetches from all APIs)
+- Subsequent requests are instant (served from cache)
+- Cache refreshes every hour, or click "↻ Refresh" in the header to force
 
 ## Deploy to Render (free)
 
 1. Push this folder to a new GitHub repo
 2. Sign up at https://render.com (free, GitHub login)
-3. Go directly to **https://dashboard.render.com/blueprints/new** (or: click "Blueprints" in left sidebar → "New Blueprint")
-4. Connect your `stock-sub-dashboard` repo, accept the defaults
-5. Render reads `render.yaml` and creates both services:
-   - `stock-sub-dashboard` (web) — your dashboard
-   - `weekly-scrape` (cron) — refreshes data every Sunday midnight UTC
-6. **Important — first deploy:** click the `stock-sub-dashboard` service, open the "Shell" tab, run `python data_fetcher.py` so the dashboard has data
+3. Go to **https://dashboard.render.com/blueprints/new** (or: click "Blueprints" in left sidebar → "New Blueprint")
+4. Connect your repo, accept the defaults
+5. Render reads `render.yaml` and creates one web service
+6. **No first-deploy data fetch needed** — the dashboard fetches on first request
 7. Open your dashboard URL on your phone
 
 **Note:** Render's free tier web service "sleeps" after 15 min of inactivity — the first dashboard load will take ~30s while the container wakes up. After that it's instant.
 
 ## Customizing
 
-Edit `.env` (or set env vars in Render):
+Edit env vars in `render.yaml` (or in `.env` for local):
 
-- `APEWISDOM_SUBS` — comma-separated subs to track ticker rankings on
-- `ARCTIC_SUBS` — comma-separated subs to fetch post content from
-- `PAGES_PER_SUB` — how many pages of 100 tickers to pull (1 = top 100)
+- `SUBS` — comma-separated subs to track ticker rankings on
+- `POST_SUBS` — comma-separated subs to fetch post content from
+- `CACHE_TTL` — seconds to cache before re-fetching (default 3600 = 1h)
 - `POSTS_PER_SUB` — how many recent top posts per sub
 - `POST_LOOKBACK_DAYS` — how far back to look for posts
 
 ## Limitations & honesty
 
-- **WSB post content is sparse** on Arctic Shift. We can show r/wallstreetbets ticker rankings (via ApeWisdom — works great) but recent WSB post titles may be missing. Other subs (stocks, investing, options, etc.) are well-covered.
-- **Trending deltas** need 2+ snapshots to show movement. On a fresh deploy, wait 24h after the first fetch for the trending section to populate.
-- **Free tier Render sleeps.** First dashboard load after 15+ min idle takes ~30s.
-- **Third-party dependency:** if ApeWisdom or Arctic Shift go down, our dashboard goes too. We mitigate by caching snapshots in SQLite.
+- **WSB post content is sparse** on Arctic Shift. We can show r/wallstreetbets ticker rankings (via ApeWisdom — works great) but recent WSB post titles may be missing. Other subs are well-covered.
+- **Cache is per-process.** On Render's free tier, the web service can have multiple workers, and each has its own cache. With our `workers=1` config, this is fine.
+- **Cache resets on deploy.** Every time Render redeploys (or the service wakes from sleep), the cache is empty and the first request will be slow.
+- **Free tier Render sleeps** after 15 min idle — first load takes ~30s.
+- **Third-party dependency:** if ApeWisdom or Arctic Shift go down, our dashboard fails. The error is shown gracefully.
+- **No 7-day historical trend** in this version (would need persistent storage).
 - **Not financial advice.** Use as a sentiment signal, not a trading signal.
 
 ## Project layout
 
 ```
 reddit-scraper/
-├── data_fetcher.py     # Pulls from ApeWisdom + Arctic Shift, writes SQLite
-├── dashboard.py        # Flask web dashboard
+├── dashboard.py        # Flask web service — fetches APIs + serves UI
 ├── requirements.txt
-├── render.yaml         # Render deployment (web + weekly cron)
+├── render.yaml         # Render deployment (one web service, no cron, no disk)
 ├── Dockerfile          # Alternative explicit Docker build
-├── .env.example        # Template for config
-├── data/               # SQLite DB (gitignored)
-│   └── dashboard.db
 └── README.md
 ```
 
