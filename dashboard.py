@@ -2,8 +2,8 @@
 Stock Sub Dashboard - Flask web service.
 
 Calls free public APIs (ApeWisdom for ticker rankings, Arctic Shift for post
-content) directly at request time. Caches results in memory for CACHE_TTL
-seconds to avoid hammering the free APIs.
+content, Yahoo Finance for prices) directly at request time. Caches results
+in memory for CACHE_TTL seconds to avoid hammering the free APIs.
 
 No database, no disk, no cron — just a single Flask app that fits on Render's
 free tier (no persistent disk required, so deploys/restarts don't lose state).
@@ -26,9 +26,11 @@ from flask import Flask, jsonify, render_template_string, request
 # Config
 # ----------------------------------------------------------------------------
 
-CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))  # 1 hour
+CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))  # 1 hour for ticker data
+PRICE_CACHE_TTL = int(os.getenv("PRICE_CACHE_TTL", "300"))  # 5 min for prices
 APEWISDOM_TIMEOUT = int(os.getenv("APEWISDOM_TIMEOUT", "20"))
 ARCTIC_TIMEOUT = int(os.getenv("ARCTIC_TIMEOUT", "30"))
+YAHOO_TIMEOUT = int(os.getenv("YAHOO_TIMEOUT", "10"))
 POSTS_PER_SUB = int(os.getenv("POSTS_PER_SUB", "30"))
 POST_LOOKBACK_DAYS = int(os.getenv("POST_LOOKBACK_DAYS", "7"))
 
@@ -66,8 +68,17 @@ HEADERS = {
     "Accept": "application/json",
 }
 
+# Yahoo Finance requires a browser-like UA
+YAHOO_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+    "Accept": "application/json",
+}
+
 _session = requests.Session()
 _session.headers.update(HEADERS)
+
+_yahoo_session = requests.Session()
+_yahoo_session.headers.update(YAHOO_HEADERS)
 
 
 def _get_json(url: str, params: dict | None = None, timeout: int = 20) -> dict | None:
@@ -78,6 +89,52 @@ def _get_json(url: str, params: dict | None = None, timeout: int = 20) -> dict |
     except Exception as e:
         print(f"[api] error fetching {url}: {e}", flush=True)
         return None
+
+
+def fetch_yahoo_prices(tickers: list[str]) -> dict[str, dict]:
+    """
+    Fetch price + 30-day history for a list of tickers from Yahoo Finance.
+    Returns {ticker: {price, prev_close, change_pct, currency, name,
+                       sparkline: [...30 closes...]}}
+    Missing tickers get an empty dict (or just absent from result).
+    """
+    out: dict[str, dict] = {}
+    # Yahoo supports up to ~10 symbols per request via comma-separated
+    # but each request is per-symbol to keep it simple and avoid weird errors
+    for ticker in tickers:
+        try:
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+            params = {"interval": "1d", "range": "1mo"}
+            resp = _yahoo_session.get(url, params=params, timeout=YAHOO_TIMEOUT)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            chart = data.get("chart", {}).get("result", [None])[0]
+            if not chart:
+                continue
+            meta = chart.get("meta", {})
+            price = meta.get("regularMarketPrice")
+            prev = meta.get("chartPreviousClose") or meta.get("previousClose")
+            if price is None:
+                continue
+            change_pct = ((price - prev) / prev * 100) if prev else 0
+            closes = (
+                chart.get("indicators", {}).get("quote", [{}])[0].get("close", [])
+            )
+            # Filter out None values that Yahoo sometimes returns
+            sparkline = [round(c, 2) for c in closes if c is not None]
+            out[ticker] = {
+                "price": round(price, 2),
+                "prev_close": round(prev, 2) if prev else None,
+                "change_pct": round(change_pct, 2),
+                "currency": meta.get("currency", "USD"),
+                "name": meta.get("longName") or meta.get("shortName") or ticker,
+                "sparkline": sparkline,
+            }
+        except Exception as e:
+            print(f"[yahoo] error for {ticker}: {e}", flush=True)
+            continue
+    return out
 
 
 # ----------------------------------------------------------------------------
@@ -176,6 +233,20 @@ def build_dashboard_payload() -> dict:
     started = time.time()
     tickers_by_sub = fetch_apewisdom_tickers()
     posts_by_sub = fetch_all_arctic_posts()
+
+    # Gather all unique tickers we need prices for (top 30 per sub, deduped)
+    all_tickers: set[str] = set()
+    for sub, tickers in tickers_by_sub.items():
+        for t in tickers[:30]:
+            sym = t.get("ticker")
+            if sym:
+                all_tickers.add(sym)
+
+    # Filter out tickers Yahoo can't quote (e.g. crypto tickers like BTC.X,
+    # and tickers with special chars). Detect crypto/dot-suffixes and skip.
+    stock_tickers = [t for t in all_tickers if "." not in t and "-" not in t]
+    prices = price_cache.get(lambda: fetch_yahoo_prices(stock_tickers))
+
     elapsed = time.time() - started
 
     # Flatten posts across subs, sort by score
@@ -286,6 +357,7 @@ def build_dashboard_payload() -> dict:
         "per_sub_top": per_sub_top,
         "top_posts": top_posts,
         "per_sub_posts": per_sub_posts,
+        "prices": prices,
     }
 
 
@@ -343,6 +415,7 @@ def build_ticker_detail(ticker: str) -> dict:
 
 app = Flask(__name__)
 cache = Cache(ttl=CACHE_TTL)
+price_cache = Cache(ttl=PRICE_CACHE_TTL)
 
 
 @app.route("/api/stats")
@@ -462,12 +535,29 @@ TEMPLATE = r"""
     border-radius: 6px;
     cursor: pointer;
     transition: all 0.15s;
+    position: relative;
   }
   .ticker-card:hover { border-color: var(--accent); transform: translateY(-1px); }
   .ticker-card .sym { font-weight: 700; color: var(--accent); font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 14px; }
   .ticker-card .name { font-size: 11px; color: var(--muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .ticker-card .cnt { font-size: 11px; color: var(--text); margin-top: 6px; display: flex; justify-content: space-between; }
-  .ticker-card .cnt .num { color: var(--accent); font-weight: 600; }
+  .ticker-card .price-row { display: flex; justify-content: space-between; align-items: baseline; margin-top: 6px; font-size: 12px; }
+  .ticker-card .price { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .ticker-card .change { font-weight: 600; font-size: 11px; padding: 1px 5px; border-radius: 3px; font-variant-numeric: tabular-nums; }
+  .ticker-card .change.up { color: var(--green); background: rgba(63, 185, 80, 0.12); }
+  .ticker-card .change.down { color: var(--red); background: rgba(248, 81, 73, 0.12); }
+  .ticker-card .change.flat { color: var(--muted); background: rgba(139, 148, 158, 0.12); }
+  .ticker-card .sparkline { margin-top: 6px; height: 28px; }
+  .ticker-card .sparkline path { fill: none; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+  .ticker-card .sparkline .up { stroke: var(--green); }
+  .ticker-card .sparkline .down { stroke: var(--red); }
+  .ticker-card .sparkline .flat { stroke: var(--muted); }
+  .ticker-card .star { position: absolute; top: 6px; right: 8px; color: var(--muted); font-size: 14px; line-height: 1; cursor: pointer; user-select: none; transition: color 0.15s; }
+  .ticker-card .star:hover { color: var(--gold); }
+  .ticker-card .star.starred { color: var(--gold); }
+  .ticker-card .no-price { color: var(--muted); font-size: 11px; margin-top: 6px; font-style: italic; }
+  .watchlist-section { background: linear-gradient(135deg, rgba(210, 153, 34, 0.08), rgba(31, 111, 235, 0.05)); border: 1px solid var(--gold); }
+  .watchlist-section h2 { color: var(--gold) !important; }
+  .watchlist-empty { color: var(--muted); font-size: 13px; padding: 16px 0; text-align: center; font-style: italic; }
   .sub-section { margin-bottom: 18px; }
   .sub-section h3 { font-size: 13px; color: var(--accent); margin: 0 0 8px 0; font-weight: 600; }
   .empty { color: var(--muted); font-style: italic; padding: 20px 0; text-align: center; }
@@ -535,6 +625,147 @@ async function loadData(force = false) {
   }
 }
 
+function renderSparkline(prices) {
+  if (!prices || !prices.sparkline || prices.sparkline.length < 2) return '';
+  const points = prices.sparkline;
+  const min = Math.min(...points);
+  const max = Math.max(...points);
+  const range = max - min || 1;
+  const w = 100, h = 28;
+  // Build a smooth polyline (just straight lines, kept simple)
+  const path = points.map((p, i) => {
+    const x = (i / (points.length - 1)) * w;
+    const y = h - ((p - min) / range) * h;
+    return `${i === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+  const dir = prices.change_pct > 0.05 ? 'up' : prices.change_pct < -0.05 ? 'down' : 'flat';
+  return `<svg class="sparkline" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
+    <path class="${dir}" d="${path}" />
+  </svg>`;
+}
+
+function renderTickerCard(t, opts = {}) {
+  const prices = dashboardData.prices || {};
+  const p = prices[t.ticker];
+  const isStarred = isInWatchlist(t.ticker);
+  const priceHtml = p ? `
+    <div class="price-row">
+      <span class="price">$${p.price.toFixed(2)}</span>
+      <span class="change ${p.change_pct > 0.05 ? 'up' : p.change_pct < -0.05 ? 'down' : 'flat'}">
+        ${p.change_pct > 0 ? '+' : ''}${p.change_pct.toFixed(2)}%
+      </span>
+    </div>
+    ${renderSparkline(p)}
+  ` : `<div class="no-price">price unavailable</div>`;
+  // Avoid double-binding onclick when card has a child star/button
+  const cardClick = `onclick="openTicker('${t.ticker}')"`;
+  return `
+    <div class="ticker-card" data-ticker="${t.ticker}">
+      <span class="star ${isStarred ? 'starred' : ''}" data-ticker="${t.ticker}"
+            onclick="event.stopPropagation(); toggleStar('${t.ticker}')"
+            title="${isStarred ? 'Remove from watchlist' : 'Add to watchlist'}">
+        ${isStarred ? '★' : '☆'}
+      </span>
+      <div style="padding-right: 20px;" ${cardClick}>
+        <div class="sym">$${t.ticker}</div>
+        <div class="name">${escapeHtml((t.name || '').slice(0, 22))}</div>
+      </div>
+      <div style="padding-right: 20px;" ${cardClick}>
+        ${priceHtml}
+      </div>
+      <div style="padding-right: 20px; margin-top: 4px; font-size: 11px; color: var(--muted);" ${cardClick}>
+        ${t.mentions} mentions · ${t.upvotes || 0} ▲
+      </div>
+    </div>
+  `;
+}
+
+// ----- Watchlist (localStorage) -----
+
+const WATCHLIST_KEY = 'stock-sub-watchlist-v1';
+
+function getWatchlist() {
+  try {
+    return JSON.parse(localStorage.getItem(WATCHLIST_KEY) || '[]');
+  } catch { return []; }
+}
+function saveWatchlist(list) {
+  localStorage.setItem(WATCHLIST_KEY, JSON.stringify(list));
+}
+function isInWatchlist(ticker) {
+  return getWatchlist().includes(ticker);
+}
+function toggleStar(ticker) {
+  const list = getWatchlist();
+  const i = list.indexOf(ticker);
+  if (i >= 0) list.splice(i, 1);
+  else list.push(ticker);
+  saveWatchlist(list);
+  // Re-render the affected card only
+  const card = document.querySelector(`.ticker-card[data-ticker="${ticker}"]`);
+  if (card) {
+    const sub = card.closest('.sub-section, .watchlist-section');
+    if (sub && sub.classList.contains('watchlist-section')) {
+      render();  // watchlist changed, re-render the watchlist section
+    } else {
+      // just update the star icon in this card
+      const star = card.querySelector('.star');
+      if (star) {
+        const starred = isInWatchlist(ticker);
+        star.classList.toggle('starred', starred);
+        star.textContent = starred ? '★' : '☆';
+        star.title = starred ? 'Remove from watchlist' : 'Add to watchlist';
+      }
+    }
+  } else {
+    render();
+  }
+}
+
+function renderWatchlistSection() {
+  const watchlist = getWatchlist();
+  if (watchlist.length === 0) {
+    return `
+      <div class="card watchlist-section">
+        <h2>⭐ My Watchlist</h2>
+        <div class="watchlist-empty">
+          Tap the ☆ on any ticker to add it here. Your watchlist is saved on this device only.
+        </div>
+      </div>
+    `;
+  }
+  // Build a card for each watched ticker from the latest data
+  const prices = (dashboardData && dashboardData.prices) || {};
+  const cards = [];
+  // Gather from per_sub_top (any sub) + cross_sub_leaderboard
+  const seen = new Set();
+  const allKnown = {};
+  for (const [sub, list] of Object.entries(dashboardData.per_sub_top || {})) {
+    for (const t of list) {
+      if (watchlist.includes(t.ticker) && !allKnown[t.ticker]) {
+        allKnown[t.ticker] = t;
+      }
+    }
+  }
+  for (const t of (dashboardData.cross_sub_leaderboard || [])) {
+    if (watchlist.includes(t.ticker) && !allKnown[t.ticker]) {
+      allKnown[t.ticker] = { ticker: t.ticker, name: t.name, mentions: t.total_mentions, upvotes: t.total_upvotes };
+    }
+  }
+  for (const ticker of watchlist) {
+    const t = allKnown[ticker] || { ticker, name: '', mentions: 0, upvotes: 0 };
+    cards.push(renderTickerCard(t));
+  }
+  return `
+    <div class="card watchlist-section">
+      <h2>⭐ My Watchlist (${watchlist.length})</h2>
+      <div class="ticker-grid">
+        ${cards.join('')}
+      </div>
+    </div>
+  `;
+}
+
 function render(d) {
   // Defensive defaults so a partial payload never crashes the whole render
   d = d || {};
@@ -572,6 +803,8 @@ function render(d) {
   }
 
   const html = `
+    ${renderWatchlistSection()}
+
     <div class="card">
       <h2>🔥 Trending (mentions Δ vs 24h)</h2>
       ${d.trending.length === 0
@@ -622,16 +855,7 @@ function render(d) {
             <div class="sub-section">
               <h3>r/${sub}</h3>
               <div class="ticker-grid">
-                ${d.per_sub_top[sub].map(t => `
-                  <div class="ticker-card" onclick="openTicker('${t.ticker}')">
-                    <div class="sym">$${t.ticker}</div>
-                    <div class="name">${escapeHtml((t.name || '').slice(0, 22))}</div>
-                    <div class="cnt">
-                      <span>${t.mentions} mentions</span>
-                      <span class="num">${t.upvotes || 0} ▲</span>
-                    </div>
-                  </div>
-                `).join('')}
+                ${d.per_sub_top[sub].map(t => renderTickerCard(t)).join('')}
               </div>
             </div>
           `).join('')
