@@ -372,12 +372,14 @@ def health():
 
 @app.route("/api/refresh", methods=["POST"])
 def api_refresh():
-    """Force-refresh the cache. Useful for debugging."""
+    """Force-refresh the cache and return the new data (same shape as /api/stats)."""
     try:
         data = build_dashboard_payload()
         cache._data = data
         cache._fetched_at = time.time()
-        return jsonify({"status": "refreshed", "fetch_time_seconds": data.get("fetch_time_seconds")})
+        # Add a flag so the UI knows this was a forced refresh
+        data["force_refreshed"] = True
+        return jsonify(data)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -515,7 +517,7 @@ let dashboardData = null;
 async function loadData(force = false) {
   const dash = document.getElementById('dashboard');
   if (force) {
-    dash.innerHTML = '<div class="loading">Refreshing (this can take ~30s on cold cache)...</div>';
+    dash.innerHTML = '<div class="loading">Refreshing (cold cache can take ~10-30s)...</div>';
   }
   try {
     const url = force ? '/api/refresh' : '/api/stats';
@@ -528,11 +530,21 @@ async function loadData(force = false) {
     }
     render(dashboardData);
   } catch (e) {
-    dash.innerHTML = '<div class="card"><div class="empty">Error loading data.</div></div>';
+    console.error('loadData failed:', e);
+    dash.innerHTML = `<div class="card"><div class="empty">Error loading data: ${escapeHtml(e.message || String(e))}</div></div>`;
   }
 }
 
 function render(d) {
+  // Defensive defaults so a partial payload never crashes the whole render
+  d = d || {};
+  d.trending = d.trending || [];
+  d.cross_sub_leaderboard = d.cross_sub_leaderboard || [];
+  d.per_sub_top = d.per_sub_top || {};
+  d.top_posts = d.top_posts || [];
+  d.per_sub_posts = d.per_sub_posts || [];
+  d.freshness = d.freshness || [];
+
   const lastScrape = d.last_scrape
     ? new Date(d.last_scrape).toLocaleString()
     : 'Never';
@@ -545,7 +557,11 @@ function render(d) {
     else if (age < 60) ageStr = ` (${age}m ago)`;
     else ageStr = ` (${Math.round(age/60)}h ago)`;
   }
-  document.getElementById('last-scrape').textContent = `Updated: ${lastScrape}${ageStr}`;
+  let headerText = `Updated: ${lastScrape}${ageStr}`;
+  if (d.force_refreshed) {
+    headerText += '  (just refreshed)';
+  }
+  document.getElementById('last-scrape').textContent = headerText;
 
   // Notice for first cold load
   const noticeArea = document.getElementById('notice-area');
