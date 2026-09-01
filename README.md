@@ -76,12 +76,13 @@ python data_fetcher.py --ticker TSLA    # recent posts about a ticker
 
 1. Push this folder to a new GitHub repo
 2. Sign up at https://render.com (free, GitHub login)
-3. Click **New → Blueprint Instance**, point at your repo
-4. Render reads `render.yaml` and creates both services:
+3. Go directly to **https://dashboard.render.com/blueprints/new** (or: click "Blueprints" in left sidebar → "New Blueprint")
+4. Connect your `stock-sub-dashboard` repo, accept the defaults
+5. Render reads `render.yaml` and creates both services:
    - `stock-sub-dashboard` (web) — your dashboard
    - `weekly-scrape` (cron) — refreshes data every Sunday midnight UTC
-5. (Optional) After first deploy, manually trigger a fetch via Render shell: `python data_fetcher.py`
-6. Open your dashboard URL on your phone
+6. **Important — first deploy:** click the `stock-sub-dashboard` service, open the "Shell" tab, run `python data_fetcher.py` so the dashboard has data
+7. Open your dashboard URL on your phone
 
 **Note:** Render's free tier web service "sleeps" after 15 min of inactivity — the first dashboard load will take ~30s while the container wakes up. After that it's instant.
 
