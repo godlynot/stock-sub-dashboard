@@ -245,21 +245,52 @@ def build_ticker_post_index(posts: list[dict]) -> dict[str, list[dict]]:
     Build a {ticker: [post, ...]} index from a list of posts.
     Posts are scanned for tickers in both title and body.
     Sorted by score (highest first), with a small cap to keep memory bounded.
+
+    Also tracks 'post ticker breadth' — how many tickers a post mentions —
+    so we can filter out 'list posts' (e.g. a market roundup that mentions
+    10 tickers in passing) which aren't actually a 'why this is trending'.
+    Posts that only mention 1-2 tickers are weighted higher (more specific).
     """
-    index: dict[str, list[dict]] = {}
-    cap = 10  # max posts per ticker in the index
+    # Pass 1: count how many tickers each post mentions
+    post_ticker_count: dict[str, int] = {}
+    post_to_tickers: dict[str, set[str]] = {}
     for p in posts:
-        # Combine title + body for ticker extraction
         text = f"{p.get('title', '')} {p.get('selftext', '')[:2000]}"
         tickers = extract_tickers(text)
+        if tickers:
+            pid = p.get("id", "")
+            post_to_tickers[pid] = tickers
+            post_ticker_count[pid] = len(tickers)
+
+    # Pass 2: build the index, skipping "list posts" (mention >= 7 tickers)
+    # and low-quality posts (score < 3)
+    # Posts that mention fewer tickers get a boost so they appear first
+    # (they're more likely to be specifically about that ticker)
+    index: dict[str, list[dict]] = {}
+    cap = 10
+    MIN_SCORE = 3
+    MAX_BREADTH = 7    # only filter out the broadest roundup posts
+    for p in posts:
+        pid = p.get("id", "")
+        breadth = post_ticker_count.get(pid, 0)
+        if breadth >= MAX_BREADTH:
+            continue
+        score = p.get("score", 0)
+        if score < MIN_SCORE:
+            continue
+        tickers = post_to_tickers.get(pid, set())
         if not tickers:
             continue
-        # Store a slimmed version of the post
+        # Specificity boost: posts that mention fewer tickers rank higher
+        # (e.g. "TSLA hits new high" is better than "market roundup mentions TSLA")
+        # Divide score by breadth — so a 100-score 1-ticker post beats a 100-score 5-ticker post
+        adjusted_score = score / max(breadth, 1)
         slim = {
-            "id": p.get("id", ""),
+            "id": pid,
             "subreddit": p.get("subreddit", ""),
             "title": (p.get("title") or "")[:200],
-            "score": p.get("score", 0),
+            "score": score,
+            "breadth": breadth,
             "num_comments": p.get("num_comments", 0),
             "permalink": f"https://reddit.com{p.get('permalink', '')}",
             "author": p.get("author", "[deleted]"),
@@ -267,10 +298,17 @@ def build_ticker_post_index(posts: list[dict]) -> dict[str, list[dict]]:
         for t in tickers:
             bucket = index.setdefault(t, [])
             if len(bucket) < cap:
-                bucket.append(slim)
-    # Sort each bucket by score desc
+                # Use a tuple (adjusted_score, raw_score) for sorting
+                bucket.append((adjusted_score, slim))
+    # Sort each bucket by adjusted score desc, then raw score desc, drop the key
     for ticker in index:
-        index[ticker].sort(key=lambda x: x.get("score", 0), reverse=True)
+        index[ticker] = [
+            slim for _, slim in sorted(
+                index[ticker],
+                key=lambda x: (x[0], x[1].get("score", 0)),
+                reverse=True,
+            )
+        ]
     return index
 
 
@@ -684,24 +722,39 @@ TEMPLATE = r"""
     margin-top: 8px;
     padding-top: 8px;
     border-top: 1px dashed var(--border);
+    min-height: 60px;  /* reserve space so cards line up even when empty */
+  }
+  .ticker-card .why-trending.empty {
+    border-top: none;
+    padding-top: 0;
+    margin-top: 4px;
   }
   .ticker-card .why-label {
-    font-size: 10px;
+    font-size: 9px;
     text-transform: uppercase;
     color: var(--muted);
     margin-bottom: 4px;
     letter-spacing: 0.3px;
+    font-weight: 600;
   }
+  .ticker-card .why-label.no-data { color: var(--border); }
   .ticker-card .why-post {
     display: block;
     font-size: 11px;
     color: var(--text);
     text-decoration: none;
-    line-height: 1.4;
-    padding: 2px 0;
-    opacity: 0.85;
+    line-height: 1.35;
+    padding: 3px 0;
+    opacity: 0.88;
   }
   .ticker-card .why-post:hover { color: var(--accent); opacity: 1; }
+  .ticker-card .why-post .meta {
+    font-size: 10px;
+    color: var(--muted);
+    margin-top: 1px;
+    font-variant-numeric: tabular-nums;
+  }
+  .ticker-card .why-post .score-num { color: var(--green); font-weight: 600; }
   .watchlist-section { background: linear-gradient(135deg, rgba(210, 153, 34, 0.08), rgba(31, 111, 235, 0.05)); border: 1px solid var(--gold); }
   .watchlist-section h2 { color: var(--gold) !important; }
   .watchlist-empty { color: var(--muted); font-size: 13px; padding: 16px 0; text-align: center; font-style: italic; }
@@ -995,17 +1048,38 @@ function renderTickerCard(t, opts = {}) {
     ${renderSparkline(p)}
   ` : `<div class="no-price">price unavailable</div>`;
   const cardClick = `onclick="openTicker('${t.ticker}')"`;
-  // Why-it's-trending section: top 1-2 post titles
-  let whyHtml = '';
+  // Why-it's-trending section: top 1-2 post titles, or placeholder if none
+  let whyHtml;
   if (tickerPosts.length > 0) {
     whyHtml = `
       <div class="why-trending" onclick="event.stopPropagation()">
         <div class="why-label">Why it's trending</div>
-        ${tickerPosts.slice(0, 2).map(post => `
-          <a class="why-post" href="${post.permalink}" target="_blank" rel="noopener" title="r/${post.subreddit} · ▲ ${post.score}">
-            ${escapeHtml(post.title.slice(0, 70))}${post.title.length > 70 ? '…' : ''}
-          </a>
-        `).join('')}
+        ${tickerPosts.slice(0, 2).map(post => {
+          // Smart truncate: cut at word boundary, not mid-word
+          let title = post.title;
+          const MAX = 56;
+          if (title.length > MAX) {
+            const cut = title.slice(0, MAX);
+            const lastSpace = cut.lastIndexOf(' ');
+            title = (lastSpace > MAX * 0.6 ? cut.slice(0, lastSpace) : cut) + '…';
+          }
+          return `
+            <a class="why-post" href="${post.permalink}" target="_blank" rel="noopener">
+              ${escapeHtml(title)}
+              <div class="meta">r/${escapeHtml(post.subreddit)} · <span class="score-num">▲ ${post.score}</span></div>
+            </a>
+          `;
+        }).join('')}
+      </div>
+    `;
+  } else {
+    // Reserve the same vertical space so cards align in the grid
+    whyHtml = `
+      <div class="why-trending empty" onclick="event.stopPropagation()">
+        <div class="why-label no-data">Why it's trending</div>
+        <div style="font-size: 10px; color: var(--muted); font-style: italic; opacity: 0.6;">
+          no post match
+        </div>
       </div>
     `;
   }
