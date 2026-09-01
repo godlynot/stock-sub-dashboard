@@ -31,8 +31,9 @@ PRICE_CACHE_TTL = int(os.getenv("PRICE_CACHE_TTL", "300"))  # 5 min for prices
 APEWISDOM_TIMEOUT = int(os.getenv("APEWISDOM_TIMEOUT", "20"))
 ARCTIC_TIMEOUT = int(os.getenv("ARCTIC_TIMEOUT", "30"))
 YAHOO_TIMEOUT = int(os.getenv("YAHOO_TIMEOUT", "10"))
-POSTS_PER_SUB = int(os.getenv("POSTS_PER_SUB", "30"))
+POSTS_PER_SUB = int(os.getenv("POSTS_PER_SUB", "100"))  # max from Arctic Shift per call
 POST_LOOKBACK_DAYS = int(os.getenv("POST_LOOKBACK_DAYS", "7"))
+TOP_POSTS_PER_TICKER = int(os.getenv("TOP_POSTS_PER_TICKER", "3"))
 
 # Subreddits we track. ApeWisdom covers all of these with rankings.
 # Arctic Shift has good coverage for all except r/wallstreetbets (sparse).
@@ -188,6 +189,85 @@ def fetch_all_arctic_posts() -> dict[str, list[dict]]:
 
 
 # ----------------------------------------------------------------------------
+# Ticker extraction (server-side, for the "why is it popular" index)
+# ----------------------------------------------------------------------------
+
+import re
+
+# Common WSB / stock-sub false-positives to filter out of bare-ticker matches
+COMMON_FALSE_POSITIVES = {
+    "I", "A", "AN", "AT", "BE", "BY", "DO", "GO", "HE", "IF", "IN", "IS",
+    "IT", "ME", "MY", "NO", "OF", "OH", "OK", "ON", "OR", "SO", "TO", "UP",
+    "US", "WE", "ALL", "AND", "ARE", "BIG", "BUY", "CAN", "DD", "END", "ERA",
+    "FOR", "FUN", "GAIN", "GDP", "GET", "GOD", "GOT", "HAS", "HOD", "HOW",
+    "IMO", "IPO", "ITM", "LOSS", "LOW", "MAN", "MOM", "NEW", "NOT", "NOW",
+    "OLD", "ONE", "OTM", "OUT", "OWN", "PAY", "PE", "PER", "PUT", "RE",
+    "ROI", "RSI", "RUN", "SAY", "SEE", "SPY", "SOLD", "STONK", "STUDY",
+    "THE", "TOO", "TOP", "TRY", "USA", "USE", "VERY", "WANT", "WAS", "WAY",
+    "WIN", "WITH", "YOLO", "YOU", "YOUR", "MOON", "TICKER", "STOCK", "SHARES",
+    "PRICE", "TODAY", "WEEK", "YEAR", "GOOD", "BAD", "BEST", "HOPE", "FEEL",
+    "LOOK", "REAL", "LOVE", "HATE", "JUST", "LIKE", "MAKE", "MANY", "MUCH",
+    "OVER", "RIDE", "SOME", "THAN", "THAT", "THEM", "THEN", "THEY", "THIS",
+    "TIME", "WHAT", "WHEN", "WILL", "WORK", "YALL", "ETF", "CEO", "CFO",
+    "OTC", "ATH", "ATL", "FD", "DCA", "YOY", "QOQ", "EOD", "EOW", "EOY",
+    "FED", "FDX", "UPS", "PCE", "CPI", "PPI", "OPEC", "IIRC", "TBH", "IMO",
+    "ELI", "PSA", "HSA", "IRA", "RMD", "USD", "EUR", "GBP", "JPY", "CAD",
+    "AUD", "NYT", "WSJ", "CNBC", "BND", "DTE", "AMC", "CEO", "GDP",
+    "HOLD", "GAIN", "PUMP", "DUMP", "MOON", "RUG", "FUD", "FOMO", "BTD",
+    "ATH", "ATL", "BTD", "BTFD", "FD", "ITM", "OTM", "ATM", "DTE", "IV",
+    "IV", "OPRA", "MEME", "APE", "DIAMOND", "HANDS", "PAPER", "TENDIES",
+    "BAGHOLDER", "AUTIST", "SIR", "JACK", "POUND", "FLOOR", "CEILING",
+}
+
+
+def extract_tickers(text: str) -> set[str]:
+    """Extract stock ticker mentions from text. Returns a set of uppercase tickers."""
+    if not text:
+        return set()
+    found = set()
+    # $TICKER form
+    found.update(re.findall(r"\$([A-Z]{1,5})\b", text))
+    # Bare UPPERCASE words (2-5 chars, longer than 1 to reduce noise)
+    bare = re.findall(r"\b([A-Z]{2,5})\b", text)
+    found.update(bare)
+    return {t for t in found if t not in COMMON_FALSE_POSITIVES and not t.isdigit()}
+
+
+def build_ticker_post_index(posts: list[dict]) -> dict[str, list[dict]]:
+    """
+    Build a {ticker: [post, ...]} index from a list of posts.
+    Posts are scanned for tickers in both title and body.
+    Sorted by score (highest first), with a small cap to keep memory bounded.
+    """
+    index: dict[str, list[dict]] = {}
+    cap = 10  # max posts per ticker in the index
+    for p in posts:
+        # Combine title + body for ticker extraction
+        text = f"{p.get('title', '')} {p.get('selftext', '')[:2000]}"
+        tickers = extract_tickers(text)
+        if not tickers:
+            continue
+        # Store a slimmed version of the post
+        slim = {
+            "id": p.get("id", ""),
+            "subreddit": p.get("subreddit", ""),
+            "title": (p.get("title") or "")[:200],
+            "score": p.get("score", 0),
+            "num_comments": p.get("num_comments", 0),
+            "permalink": f"https://reddit.com{p.get('permalink', '')}",
+            "author": p.get("author", "[deleted]"),
+        }
+        for t in tickers:
+            bucket = index.setdefault(t, [])
+            if len(bucket) < cap:
+                bucket.append(slim)
+    # Sort each bucket by score desc
+    for ticker in index:
+        index[ticker].sort(key=lambda x: x.get("score", 0), reverse=True)
+    return index
+
+
+# ----------------------------------------------------------------------------
 # In-memory cache
 # ----------------------------------------------------------------------------
 
@@ -246,6 +326,10 @@ def build_dashboard_payload() -> dict:
     # and tickers with special chars). Detect crypto/dot-suffixes and skip.
     stock_tickers = [t for t in all_tickers if "." not in t and "-" not in t]
     prices = price_cache.get(lambda: fetch_yahoo_prices(stock_tickers))
+
+    # Build the per-ticker post index from all fetched posts
+    all_posts_flat = [p for sub_posts in posts_by_sub.values() for p in sub_posts]
+    full_ticker_index = build_ticker_post_index(all_posts_flat)
 
     elapsed = time.time() - started
 
@@ -324,6 +408,19 @@ def build_dashboard_payload() -> dict:
     trending_list.sort(key=lambda v: v["delta"], reverse=True)
     trending_list = trending_list[:15]
 
+    # Slim the per-ticker post index to just the tickers we actually display
+    # (cross-sub leaderboard + trending) to keep the payload small
+    important_tickers = set()
+    for t in cross_sub_list:
+        important_tickers.add(t["ticker"])
+    for t in trending_list:
+        important_tickers.add(t["ticker"])
+    ticker_posts_payload = {
+        t: full_ticker_index.get(t, [])[:TOP_POSTS_PER_TICKER]
+        for t in important_tickers
+        if full_ticker_index.get(t)
+    }
+
     # Per-subreddit post summary
     per_sub_posts = []
     for sub, posts in posts_by_sub.items():
@@ -358,6 +455,7 @@ def build_dashboard_payload() -> dict:
         "top_posts": top_posts,
         "per_sub_posts": per_sub_posts,
         "prices": prices,
+        "ticker_posts": ticker_posts_payload,
     }
 
 
@@ -382,28 +480,15 @@ def build_ticker_detail(ticker: str) -> dict:
                 })
                 break
 
-    # Posts mentioning this ticker
-    posts = []
-    for sub, plist in posts_by_sub.items():
-        for p in plist:
-            title = (p.get("title") or "")
-            if upper in title.upper() or f"${upper}" in title.upper():
-                posts.append({
-                    "id": p.get("id"),
-                    "subreddit": p.get("subreddit", sub),
-                    "title": title,
-                    "score": p.get("score", 0),
-                    "num_comments": p.get("num_comments", 0),
-                    "permalink": f"https://reddit.com{p.get('permalink', '')}",
-                    "author": p.get("author"),
-                })
-    posts.sort(key=lambda p: p["score"], reverse=True)
-    posts = posts[:30]
+    # Use the per-ticker post index for richer post coverage
+    all_posts_flat = [p for sub_posts in posts_by_sub.values() for p in sub_posts]
+    full_ticker_index = build_ticker_post_index(all_posts_flat)
+    posts = full_ticker_index.get(upper, [])[:30]
 
     return {
         "ticker": upper,
         "latest_per_sub": sorted(latest, key=lambda x: x.get("mentions", 0) or 0, reverse=True),
-        "recent_posts": posts[:30],
+        "recent_posts": posts,
         # 7-day trend unavailable in this stateless design (would need a DB)
         "trend_7d": [],
     }
@@ -555,6 +640,28 @@ TEMPLATE = r"""
   .ticker-card .star:hover { color: var(--gold); }
   .ticker-card .star.starred { color: var(--gold); }
   .ticker-card .no-price { color: var(--muted); font-size: 11px; margin-top: 6px; font-style: italic; }
+  .ticker-card .why-trending {
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px dashed var(--border);
+  }
+  .ticker-card .why-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 4px;
+    letter-spacing: 0.3px;
+  }
+  .ticker-card .why-post {
+    display: block;
+    font-size: 11px;
+    color: var(--text);
+    text-decoration: none;
+    line-height: 1.4;
+    padding: 2px 0;
+    opacity: 0.85;
+  }
+  .ticker-card .why-post:hover { color: var(--accent); opacity: 1; }
   .watchlist-section { background: linear-gradient(135deg, rgba(210, 153, 34, 0.08), rgba(31, 111, 235, 0.05)); border: 1px solid var(--gold); }
   .watchlist-section h2 { color: var(--gold) !important; }
   .watchlist-empty { color: var(--muted); font-size: 13px; padding: 16px 0; text-align: center; font-style: italic; }
@@ -646,6 +753,7 @@ function renderSparkline(prices) {
 
 function renderTickerCard(t, opts = {}) {
   const prices = dashboardData.prices || {};
+  const tickerPosts = (dashboardData.ticker_posts || {})[t.ticker] || [];
   const p = prices[t.ticker];
   const isStarred = isInWatchlist(t.ticker);
   const priceHtml = p ? `
@@ -657,8 +765,21 @@ function renderTickerCard(t, opts = {}) {
     </div>
     ${renderSparkline(p)}
   ` : `<div class="no-price">price unavailable</div>`;
-  // Avoid double-binding onclick when card has a child star/button
   const cardClick = `onclick="openTicker('${t.ticker}')"`;
+  // Why-it's-trending section: top 1-2 post titles
+  let whyHtml = '';
+  if (tickerPosts.length > 0) {
+    whyHtml = `
+      <div class="why-trending" onclick="event.stopPropagation()">
+        <div class="why-label">Why it's trending</div>
+        ${tickerPosts.slice(0, 2).map(post => `
+          <a class="why-post" href="${post.permalink}" target="_blank" rel="noopener" title="r/${post.subreddit} · ▲ ${post.score}">
+            ${escapeHtml(post.title.slice(0, 70))}${post.title.length > 70 ? '…' : ''}
+          </a>
+        `).join('')}
+      </div>
+    `;
+  }
   return `
     <div class="ticker-card" data-ticker="${t.ticker}">
       <span class="star ${isStarred ? 'starred' : ''}" data-ticker="${t.ticker}"
@@ -676,6 +797,7 @@ function renderTickerCard(t, opts = {}) {
       <div style="padding-right: 20px; margin-top: 4px; font-size: 11px; color: var(--muted);" ${cardClick}>
         ${t.mentions} mentions · ${t.upvotes || 0} ▲
       </div>
+      ${whyHtml}
     </div>
   `;
 }
