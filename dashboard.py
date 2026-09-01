@@ -92,20 +92,26 @@ def _get_json(url: str, params: dict | None = None, timeout: int = 20) -> dict |
         return None
 
 
-def fetch_yahoo_prices(tickers: list[str]) -> dict[str, dict]:
+# Yahoo Finance interval/range mapping
+TIMEFRAMES = {
+    "1w":  ("1d", "5d"),    # 5 daily candles
+    "1mo": ("1d", "1mo"),   # ~21 daily candles (current default)
+    "3mo": ("1d", "3mo"),   # ~63 daily candles
+}
+
+def fetch_yahoo_prices(tickers: list[str], timeframe: str = "1mo") -> dict[str, dict]:
     """
-    Fetch price + 30-day history for a list of tickers from Yahoo Finance.
+    Fetch price + history for a list of tickers from Yahoo Finance.
     Returns {ticker: {price, prev_close, change_pct, currency, name,
-                       sparkline: [...30 closes...]}}
+                       sparkline: [...closes...]}}
     Missing tickers get an empty dict (or just absent from result).
     """
     out: dict[str, dict] = {}
-    # Yahoo supports up to ~10 symbols per request via comma-separated
-    # but each request is per-symbol to keep it simple and avoid weird errors
+    interval, range_ = TIMEFRAMES.get(timeframe, TIMEFRAMES["1mo"])
     for ticker in tickers:
         try:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-            params = {"interval": "1d", "range": "1mo"}
+            params = {"interval": interval, "range": range_}
             resp = _yahoo_session.get(url, params=params, timeout=YAHOO_TIMEOUT)
             if resp.status_code != 200:
                 continue
@@ -131,6 +137,7 @@ def fetch_yahoo_prices(tickers: list[str]) -> dict[str, dict]:
                 "currency": meta.get("currency", "USD"),
                 "name": meta.get("longName") or meta.get("shortName") or ticker,
                 "sparkline": sparkline,
+                "timeframe": timeframe,
             }
         except Exception as e:
             print(f"[yahoo] error for {ticker}: {e}", flush=True)
@@ -325,7 +332,8 @@ def build_dashboard_payload() -> dict:
     # Filter out tickers Yahoo can't quote (e.g. crypto tickers like BTC.X,
     # and tickers with special chars). Detect crypto/dot-suffixes and skip.
     stock_tickers = [t for t in all_tickers if "." not in t and "-" not in t]
-    prices = price_cache.get(lambda: fetch_yahoo_prices(stock_tickers))
+    # Default dashboard prices are 1mo (the initial render)
+    prices = price_caches["1mo"].get(lambda: fetch_yahoo_prices(stock_tickers, "1mo"))
 
     # Build the per-ticker post index from all fetched posts
     all_posts_flat = [p for sub_posts in posts_by_sub.values() for p in sub_posts]
@@ -500,7 +508,11 @@ def build_ticker_detail(ticker: str) -> dict:
 
 app = Flask(__name__)
 cache = Cache(ttl=CACHE_TTL)
-price_cache = Cache(ttl=PRICE_CACHE_TTL)
+# Separate price cache per timeframe (1w / 1mo / 3mo) so we don't refetch
+# the same data when the user toggles between them
+price_caches: dict[str, Cache] = {
+    tf: Cache(ttl=PRICE_CACHE_TTL) for tf in TIMEFRAMES.keys()
+}
 
 
 @app.route("/api/stats")
@@ -509,6 +521,34 @@ def api_stats():
     try:
         data = cache.get(build_dashboard_payload)
         return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/prices")
+def api_prices():
+    """
+    Fetch prices for a given timeframe (1w / 1mo / 3mo).
+    Used by the timeframe selector — only the prices dict is returned.
+    Cached per-timeframe for PRICE_CACHE_TTL seconds.
+    """
+    timeframe = request.args.get("timeframe", "1mo")
+    if timeframe not in TIMEFRAMES:
+        return jsonify({"error": f"invalid timeframe; use one of {list(TIMEFRAMES)}"}), 400
+    # Discover the same ticker list as the main payload
+    tickers_by_sub = fetch_apewisdom_tickers()
+    all_tickers = set()
+    for sub, tickers in tickers_by_sub.items():
+        for t in tickers[:30]:
+            sym = t.get("ticker")
+            if sym:
+                all_tickers.add(sym)
+    stock_tickers = [t for t in all_tickers if "." not in t and "-" not in t]
+    try:
+        prices = price_caches[timeframe].get(
+            lambda: fetch_yahoo_prices(stock_tickers, timeframe)
+        )
+        return jsonify(prices)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -679,6 +719,71 @@ TEMPLATE = r"""
   .stat-line .lbl { color: var(--muted); }
   .stat-line .val { color: var(--text); font-weight: 500; }
   .notice { background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; margin-bottom: 14px; font-size: 12px; color: var(--muted); }
+
+  /* ----- Search + filter bar ----- */
+  .controls-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin-bottom: 16px;
+  }
+  .search-input {
+    flex: 1 1 200px;
+    min-width: 0;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 12px;
+    color: var(--text);
+    font-size: 14px;
+    font-family: inherit;
+  }
+  .search-input:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .search-input::placeholder { color: var(--muted); }
+  .timeframe-selector {
+    display: flex;
+    gap: 4px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 3px;
+  }
+  .timeframe-selector button {
+    background: transparent;
+    border: none;
+    color: var(--muted);
+    padding: 5px 10px;
+    border-radius: 4px;
+    font-size: 12px;
+    cursor: pointer;
+    font-family: inherit;
+    font-weight: 500;
+  }
+  .timeframe-selector button:hover { color: var(--text); }
+  .timeframe-selector button.active {
+    background: var(--accent);
+    color: white;
+  }
+  .filter-count {
+    font-size: 12px;
+    color: var(--muted);
+    white-space: nowrap;
+  }
+  .no-results {
+    text-align: center;
+    color: var(--muted);
+    font-style: italic;
+    padding: 30px 0;
+  }
+  .sub-section.hidden-by-filter { display: none; }
 </style>
 </head>
 <body>
@@ -692,6 +797,19 @@ TEMPLATE = r"""
 
 <main>
   <div id="notice-area"></div>
+
+  <div class="controls-bar">
+    <input type="text" id="search-input" class="search-input"
+           placeholder="🔍 Filter tickers by symbol or name (e.g. TSLA, AI, energy)"
+           oninput="onFilterChange()" />
+    <div class="timeframe-selector" role="tablist" aria-label="Sparkline timeframe">
+      <button data-tf="1w" onclick="setTimeframe('1w')">1W</button>
+      <button data-tf="1mo" class="active" onclick="setTimeframe('1mo')">1M</button>
+      <button data-tf="3mo" onclick="setTimeframe('3mo')">3M</button>
+    </div>
+    <span class="filter-count" id="filter-count"></span>
+  </div>
+
   <div class="grid" id="dashboard">
     <div class="loading">Loading dashboard data...</div>
   </div>
@@ -751,6 +869,117 @@ function renderSparkline(prices) {
   </svg>`;
 }
 
+// ----- Search + filter state -----
+let currentFilter = '';
+let currentTimeframe = '1mo';
+
+function tickerMatchesFilter(t, filter) {
+  if (!filter) return true;
+  const f = filter.toLowerCase().trim();
+  if (!f) return true;
+  return (
+    t.ticker.toLowerCase().includes(f) ||
+    (t.name || '').toLowerCase().includes(f)
+  );
+}
+
+function onFilterChange() {
+  currentFilter = document.getElementById('search-input').value;
+  applyFilter();
+}
+
+function applyFilter() {
+  // Update per-sub visibility
+  let totalShown = 0;
+  let totalAll = 0;
+  if (dashboardData && dashboardData.per_sub_top) {
+    for (const [sub, list] of Object.entries(dashboardData.per_sub_top)) {
+      let shownInSub = 0;
+      for (const t of list) {
+        totalAll++;
+        if (tickerMatchesFilter(t, currentFilter)) {
+          shownInSub++;
+          totalShown++;
+        }
+      }
+      const section = document.querySelector(`.sub-section[data-sub="${sub}"]`);
+      if (section) {
+        if (shownInSub === 0 && currentFilter) {
+          section.classList.add('hidden-by-filter');
+        } else {
+          section.classList.remove('hidden-by-filter');
+        }
+      }
+    }
+  }
+  // Update per-card visibility inside each sub grid
+  document.querySelectorAll('.ticker-card').forEach(card => {
+    const ticker = card.getAttribute('data-ticker');
+    const sub = card.getAttribute('data-sub') || '';
+    const name = card.getAttribute('data-name') || '';
+    const t = { ticker, name };
+    if (tickerMatchesFilter(t, currentFilter)) {
+      card.style.display = '';
+    } else {
+      card.style.display = 'none';
+    }
+  });
+  // Update count
+  const countEl = document.getElementById('filter-count');
+  if (countEl) {
+    if (currentFilter) {
+      countEl.textContent = `${totalShown}/${totalAll} match`;
+    } else {
+      countEl.textContent = `${totalAll} tickers`;
+    }
+  }
+  // Show "no results" if everything's filtered out
+  if (currentFilter && totalShown === 0) {
+    const dash = document.getElementById('dashboard');
+    let noRes = document.getElementById('no-results-msg');
+    if (!noRes) {
+      noRes = document.createElement('div');
+      noRes.id = 'no-results-msg';
+      noRes.className = 'no-results';
+      noRes.textContent = `No tickers match "${currentFilter}"`;
+      dash.prepend(noRes);
+    }
+  } else {
+    const noRes = document.getElementById('no-results-msg');
+    if (noRes) noRes.remove();
+  }
+}
+
+// ----- Timeframe selector -----
+let timeframeData = { '1w': null, '1mo': null, '3mo': null };
+let timeframeLoading = false;
+
+async function setTimeframe(tf) {
+  if (tf === currentTimeframe) return;
+  currentTimeframe = tf;
+  // Update button states
+  document.querySelectorAll('.timeframe-selector button').forEach(btn => {
+    btn.classList.toggle('active', btn.getAttribute('data-tf') === tf);
+  });
+  // Fetch if we don't have it cached client-side
+  if (!timeframeData[tf]) {
+    try {
+      const resp = await fetch(`/api/prices?timeframe=${tf}`);
+      if (resp.ok) {
+        timeframeData[tf] = await resp.json();
+      }
+    } catch (e) {
+      console.error('Timeframe fetch failed:', e);
+      return;
+    }
+  }
+  // Swap into dashboardData.prices and re-render
+  if (timeframeData[tf] && dashboardData) {
+    dashboardData.prices = timeframeData[tf];
+    render(dashboardData);
+  }
+}
+
 function renderTickerCard(t, opts = {}) {
   const prices = dashboardData.prices || {};
   const tickerPosts = (dashboardData.ticker_posts || {})[t.ticker] || [];
@@ -781,7 +1010,7 @@ function renderTickerCard(t, opts = {}) {
     `;
   }
   return `
-    <div class="ticker-card" data-ticker="${t.ticker}">
+    <div class="ticker-card" data-ticker="${t.ticker}" data-sub="${opts.sub || ''}" data-name="${escapeHtml(t.name || '')}">
       <span class="star ${isStarred ? 'starred' : ''}" data-ticker="${t.ticker}"
             onclick="event.stopPropagation(); toggleStar('${t.ticker}')"
             title="${isStarred ? 'Remove from watchlist' : 'Add to watchlist'}">
@@ -876,7 +1105,7 @@ function renderWatchlistSection() {
   }
   for (const ticker of watchlist) {
     const t = allKnown[ticker] || { ticker, name: '', mentions: 0, upvotes: 0 };
-    cards.push(renderTickerCard(t));
+    cards.push(renderTickerCard(t, {sub: 'watchlist'}));
   }
   return `
     <div class="card watchlist-section">
@@ -974,10 +1203,10 @@ function render(d) {
       ${Object.keys(d.per_sub_top).length === 0
         ? '<div class="empty">No data yet.</div>'
         : Object.keys(d.per_sub_top).sort().map(sub => `
-            <div class="sub-section">
+            <div class="sub-section" data-sub="${sub}">
               <h3>r/${sub}</h3>
               <div class="ticker-grid">
-                ${d.per_sub_top[sub].map(t => renderTickerCard(t)).join('')}
+                ${d.per_sub_top[sub].map(t => renderTickerCard(t, {sub: sub})).join('')}
               </div>
             </div>
           `).join('')
@@ -1019,6 +1248,8 @@ function render(d) {
   `;
 
   document.getElementById('dashboard').innerHTML = html;
+  // Re-apply any active search filter to the newly-rendered cards
+  applyFilter();
 }
 
 function escapeHtml(s) {
