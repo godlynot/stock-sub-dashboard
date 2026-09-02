@@ -28,6 +28,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))  # 1 hour for ticker data
 PRICE_CACHE_TTL = int(os.getenv("PRICE_CACHE_TTL", "300"))  # 5 min for prices
+MACRO_CACHE_TTL = int(os.getenv("MACRO_CACHE_TTL", "900"))  # 15 min for macro
 APEWISDOM_TIMEOUT = int(os.getenv("APEWISDOM_TIMEOUT", "20"))
 ARCTIC_TIMEOUT = int(os.getenv("ARCTIC_TIMEOUT", "30"))
 YAHOO_TIMEOUT = int(os.getenv("YAHOO_TIMEOUT", "10"))
@@ -192,6 +193,127 @@ def fetch_all_arctic_posts() -> dict[str, list[dict]]:
     for sub in POST_SUBS:
         out[sub] = fetch_arctic_posts(sub)
         time.sleep(0.5)
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Macro data (10Y, 2Y, VIX, WTI, S&P, NASDAQ, Gold, DXY)
+# ----------------------------------------------------------------------------
+
+MACRO_TICKERS = {
+    # Yahoo tickers (^TNX = 10Y, ^FVX = 5Y, ^TYX = 30Y yields;
+    # price is 10x the yield so we divide by 10)
+    # ^VIX = VIX, ^GSPC = S&P 500, ^IXIC = NASDAQ, GC=F = Gold, CL=F = WTI Crude, DX-Y.NYB = DXY
+    "10Y":   ("yahoo_yield", "^TNX",   "10Y Treasury"),
+    "5Y":    ("yahoo_yield", "^FVX",   "5Y Treasury"),
+    "30Y":   ("yahoo_yield", "^TYX",   "30Y Treasury"),
+    "VIX":   ("yahoo",      "^VIX",    "VIX"),
+    "SPX":   ("yahoo",      "^GSPC",   "S&P 500"),
+    "IXIC":  ("yahoo",      "^IXIC",   "NASDAQ"),
+    "GOLD":  ("yahoo",      "GC=F",    "Gold"),
+    "OIL":   ("yahoo",      "CL=F",    "WTI Crude"),
+    "DXY":   ("yahoo",      "DX-Y.NYB","Dollar Index"),
+}
+
+
+def fetch_fred_series(series_id: str) -> dict | None:
+    """
+    Fetch the latest value of a FRED CSV series.
+    Returns {"value": float, "date": "YYYY-MM-DD", "source": "FRED"} or None.
+    Currently unused (we get yields from Yahoo) but kept for reference.
+    """
+    import datetime
+    end = datetime.date.today().isoformat()
+    start = (datetime.date.today() - datetime.timedelta(days=14)).isoformat()
+    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}&cosd={start}&coed={end}"
+    try:
+        resp = _session.get(url, timeout=30)
+        resp.raise_for_status()
+        lines = resp.text.strip().split("\n")
+        data_lines = [l for l in lines if l and l[0].isdigit()]
+        if not data_lines:
+            return None
+        last = data_lines[-1]
+        date, value = last.split(",")
+        if value.strip() in (".", ""):
+            return None
+        return {
+            "value": float(value),
+            "date": date,
+            "source": "FRED",
+        }
+    except Exception as e:
+        print(f"[macro] FRED error for {series_id}: {e}", flush=True)
+        return None
+
+
+def fetch_yahoo_quote(ticker: str) -> dict | None:
+    """
+    Fetch a single price quote from Yahoo Finance.
+    Returns {"value": price, "prev_close": prev, "change_pct": pct, "source": "Yahoo"} or None.
+    """
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+        params = {"interval": "1d", "range": "5d"}
+        resp = _yahoo_session.get(url, params=params, timeout=YAHOO_TIMEOUT)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        chart = data.get("chart", {}).get("result", [None])[0]
+        if not chart:
+            return None
+        meta = chart.get("meta", {})
+        price = meta.get("regularMarketPrice")
+        prev = meta.get("chartPreviousClose") or meta.get("previousClose")
+        if price is None:
+            return None
+        change_pct = ((price - prev) / prev * 100) if prev else 0
+        return {
+            "value": round(price, 2),
+            "prev_close": round(prev, 2) if prev else None,
+            "change_pct": round(change_pct, 2),
+            "source": "Yahoo",
+        }
+    except Exception as e:
+        print(f"[macro] Yahoo error for {ticker}: {e}", flush=True)
+        return None
+
+
+def fetch_macro_indicators() -> dict[str, dict]:
+    """
+    Fetch all macro indicators (10Y, 5Y, 30Y Treasury yields, VIX, S&P, NASDAQ, Gold, Oil, DXY).
+    Returns {key: {value, ...}}. Missing series are just absent from the result.
+    Parallelized with threads for speed.
+    Treasury yield tickers (^TNX, ^FVX, ^TYX) return price 10x the actual yield,
+    so we divide by 10 to get the percentage.
+    """
+    import concurrent.futures
+    out: dict[str, dict] = {}
+
+    def _fetch_one(item):
+        key, (kind, ticker, label) = item
+        data = fetch_yahoo_quote(ticker)
+        if not data:
+            return None
+        # ^TNX, ^FVX, ^TYX already return the yield as a percentage (e.g. 4.796 = 4.796%)
+        # No need to divide.
+        return key, {**data, "label": label, "id": ticker}
+
+    # Run all 9 macro fetches in parallel
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+        results = list(ex.map(_fetch_one, MACRO_TICKERS.items()))
+    for r in results:
+        if r:
+            key, data = r
+            out[key] = data
+    # Compute yield curve spread (10Y - 5Y). Important recession indicator.
+    if "10Y" in out and "5Y" in out:
+        spread = out["10Y"]["value"] - out["5Y"]["value"]
+        out["CURVE_10Y5Y"] = {
+            "value": round(spread, 2),
+            "label": "10Y-5Y Spread",
+            "source": "computed",
+        }
     return out
 
 
@@ -377,6 +499,9 @@ def build_dashboard_payload() -> dict:
     all_posts_flat = [p for sub_posts in posts_by_sub.values() for p in sub_posts]
     full_ticker_index = build_ticker_post_index(all_posts_flat)
 
+    # Fetch macro indicators (cached separately for 15 min)
+    macro = macro_cache.get(fetch_macro_indicators)
+
     elapsed = time.time() - started
 
     # Flatten posts across subs, sort by score
@@ -502,6 +627,7 @@ def build_dashboard_payload() -> dict:
         "per_sub_posts": per_sub_posts,
         "prices": prices,
         "ticker_posts": ticker_posts_payload,
+        "macro": macro,
     }
 
 
@@ -551,6 +677,8 @@ cache = Cache(ttl=CACHE_TTL)
 price_caches: dict[str, Cache] = {
     tf: Cache(ttl=PRICE_CACHE_TTL) for tf in TIMEFRAMES.keys()
 }
+# Macro data is less volatile - cache for 15 min
+macro_cache = Cache(ttl=MACRO_CACHE_TTL)
 
 
 @app.route("/api/stats")
@@ -837,6 +965,59 @@ TEMPLATE = r"""
     padding: 30px 0;
   }
   .sub-section.hidden-by-filter { display: none; }
+
+  /* ----- Macro strip ----- */
+  .macro-strip {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0;
+    background: linear-gradient(135deg, var(--panel) 0%, var(--panel-2) 100%);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 16px;
+    overflow: hidden;
+  }
+  .macro-cell {
+    flex: 1 1 110px;
+    min-width: 110px;
+    padding: 10px 14px;
+    border-right: 1px solid var(--border);
+    text-align: center;
+  }
+  .macro-cell:last-child { border-right: none; }
+  .macro-cell .macro-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    color: var(--muted);
+    letter-spacing: 0.4px;
+    font-weight: 600;
+    margin-bottom: 4px;
+  }
+  .macro-cell .macro-value {
+    font-size: 16px;
+    font-weight: 700;
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+    line-height: 1.1;
+  }
+  .macro-cell .macro-change {
+    font-size: 10px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    margin-top: 2px;
+  }
+  .macro-cell .macro-change.up { color: var(--green); }
+  .macro-cell .macro-change.down { color: var(--red); }
+  .macro-cell .macro-change.flat { color: var(--muted); }
+  .macro-cell.inverted .macro-change.up { color: var(--red); }   /* for VIX */
+  .macro-cell.inverted .macro-change.down { color: var(--green); }
+  .macro-cell.warning .macro-value { color: var(--gold); }       /* for inverted yield curve */
+  .macro-strip-meta {
+    font-size: 10px;
+    color: var(--muted);
+    text-align: right;
+    padding: 4px 14px 8px;
+  }
 </style>
 </head>
 <body>
@@ -1147,6 +1328,55 @@ function toggleStar(ticker) {
   }
 }
 
+// ----- Macro strip -----
+
+function formatMacroValue(key, value) {
+  // Different formatting for different series
+  if (key === '10Y' || key === '5Y' || key === '30Y') return value.toFixed(2) + '%';
+  if (key === 'CURVE_10Y5Y') return (value >= 0 ? '+' : '') + value.toFixed(2) + '%';
+  if (key === 'VIX') return value.toFixed(2);
+  if (key === 'OIL') return '$' + value.toFixed(2);
+  if (key === 'SPX' || key === 'IXIC') return value.toLocaleString('en-US', { maximumFractionDigits: 1 });
+  if (key === 'GOLD') return '$' + value.toLocaleString('en-US', { maximumFractionDigits: 0 });
+  if (key === 'DXY') return value.toFixed(2);
+  return String(value);
+}
+
+function renderMacroStrip(macro) {
+  if (!macro) return '';
+  // Order: rates first, then equities, then commodities, then derived
+  const order = ['10Y', '5Y', '30Y', 'CURVE_10Y5Y', 'VIX', 'SPX', 'IXIC', 'GOLD', 'OIL', 'DXY'];
+  const cells = [];
+  for (const key of order) {
+    const m = macro[key];
+    if (!m) continue;
+    const changePct = m.change_pct;
+    let changeClass = 'flat';
+    let changeText = '';
+    if (changePct !== undefined && changePct !== null) {
+      if (changePct > 0.05) changeClass = 'up';
+      else if (changePct < -0.05) changeClass = 'down';
+      changeText = `${changePct > 0 ? '+' : ''}${changePct.toFixed(2)}%`;
+    }
+    // Inverted-color cells: VIX (down=good) and yield spread (down=warning)
+    const isInverted = (key === 'VIX');
+    const isWarning = (key === 'CURVE_10Y5Y' && m.value < 0);
+    cells.push(`
+      <div class="macro-cell ${isInverted ? 'inverted' : ''} ${isWarning ? 'warning' : ''}">
+        <div class="macro-label">${escapeHtml(m.label)}</div>
+        <div class="macro-value">${formatMacroValue(key, m.value)}</div>
+        ${changeText ? `<div class="macro-change ${changeClass}">${changeText}</div>` : ''}
+      </div>
+    `);
+  }
+  if (cells.length === 0) return '';
+  return `
+    <div class="macro-strip">
+      ${cells.join('')}
+    </div>
+  `;
+}
+
 function renderWatchlistSection() {
   const watchlist = getWatchlist();
   if (watchlist.length === 0) {
@@ -1228,6 +1458,7 @@ function render(d) {
   }
 
   const html = `
+    ${renderMacroStrip(d.macro)}
     ${renderWatchlistSection()}
 
     <div class="card">
