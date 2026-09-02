@@ -32,20 +32,29 @@ MACRO_CACHE_TTL = int(os.getenv("MACRO_CACHE_TTL", "900"))  # 15 min for macro
 APEWISDOM_TIMEOUT = int(os.getenv("APEWISDOM_TIMEOUT", "20"))
 ARCTIC_TIMEOUT = int(os.getenv("ARCTIC_TIMEOUT", "30"))
 YAHOO_TIMEOUT = int(os.getenv("YAHOO_TIMEOUT", "10"))
-POSTS_PER_SUB = int(os.getenv("POSTS_PER_SUB", "100"))  # max from Arctic Shift per call
+POSTS_PER_SUB = int(os.getenv("POSTS_PER_SUB", "300"))  # max from Arctic Shift per call
 POST_LOOKBACK_DAYS = int(os.getenv("POST_LOOKBACK_DAYS", "7"))
+COMMENTS_PER_SUB = int(os.getenv("COMMENTS_PER_SUB", "200"))  # from Arctic Shift
 TOP_POSTS_PER_TICKER = int(os.getenv("TOP_POSTS_PER_TICKER", "3"))
+POST_BODY_EXTRACT_CHARS = int(os.getenv("POST_BODY_EXTRACT_CHARS", "5000"))  # was 2000
 
 # Subreddits we track. ApeWisdom covers all of these with rankings.
 # Arctic Shift has good coverage for all except r/wallstreetbets (sparse).
 DEFAULT_SUBS = [
     "wallstreetbets",
+    "wallstreetbetsnew",
     "stocks",
     "investing",
     "options",
     "StockMarket",
     "pennystocks",
     "SPACs",
+    "Superstonk",
+    "SNDK",
+    "MSTR",
+    "amcstock",
+    "nvidia",
+    "BBBY",
 ]
 
 SUBS = [
@@ -54,10 +63,18 @@ SUBS = [
     if s.strip()
 ]
 
-# Subs we fetch post content for. WSB omitted — Arctic Shift has sparse WSB data.
+# Subs we fetch post content for from Arctic Shift.
+# Excludes WSB (sparse) but includes everything else.
 POST_SUBS = [
     s.strip()
-    for s in os.getenv("POST_SUBS", "stocks,investing,options,StockMarket,pennystocks,SPACs").split(",")
+    for s in os.getenv("POST_SUBS", ",".join([s for s in DEFAULT_SUBS if s != "wallstreetbets"])).split(",")
+    if s.strip()
+]
+
+# Subs we fetch comments for (smaller set to keep fetch time sane)
+COMMENT_SUBS = [
+    s.strip()
+    for s in os.getenv("COMMENT_SUBS", "wallstreetbets,wallstreetbetsnew,stocks,investing,options,StockMarket,Superstonk,nvidia").split(",")
     if s.strip()
 ]
 
@@ -168,23 +185,114 @@ def fetch_apewisdom_tickers() -> dict[str, list[dict]]:
 
 
 def fetch_arctic_posts(sub: str) -> list[dict]:
-    """Fetch recent top posts for one subreddit from Arctic Shift."""
+    """
+    Fetch recent top posts for one subreddit from Arctic Shift.
+    Paginated up to 3 pages (300 posts max) to increase coverage.
+    Arctic Shift doesn't support sort=score, so we pull the latest
+    posts and sort by score client-side.
+    """
     now = int(time.time())
     after = now - POST_LOOKBACK_DAYS * 86400
     url = "https://arctic-shift.photon-reddit.com/api/posts/search"
-    params = {
+    base_params = {
         "subreddit": sub,
         "limit": 100,
         "after": after,
         "sort": "desc",
     }
-    data = _get_json(url, params=params, timeout=ARCTIC_TIMEOUT)
-    if not data or "data" not in data:
-        return []
-    # Sort by score client-side (Arctic Shift doesn't support sort=score)
-    posts = data["data"]
-    posts.sort(key=lambda p: p.get("score", 0), reverse=True)
-    return posts[:POSTS_PER_SUB]
+    all_posts = []
+    seen_ids: set[str] = set()
+    cursor = None
+    max_pages = 3  # 3 * 100 = 300 posts
+
+    for _ in range(max_pages):
+        params = dict(base_params)
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            resp = _session.get(url, params=params, timeout=ARCTIC_TIMEOUT)
+            if resp.status_code in (400, 422) and cursor is None:
+                params.pop("after", None)
+                resp = _session.get(url, params=params, timeout=ARCTIC_TIMEOUT)
+            if resp.status_code != 200:
+                break
+            data = resp.json()
+        except requests.RequestException as e:
+            print(f"  [!] Arctic Shift error for r/{sub}: {e}", file=sys.stderr)
+            break
+
+        posts = data.get("data", [])
+        if not posts:
+            break
+        new_count = 0
+        for p in posts:
+            pid = p.get("id")
+            if pid and pid not in seen_ids:
+                seen_ids.add(pid)
+                all_posts.append(p)
+                new_count += 1
+        if new_count == 0:
+            break
+        cursor = data.get("cursor")
+        if not cursor:
+            break
+        time.sleep(0.3)
+
+    all_posts.sort(key=lambda p: p.get("score", 0), reverse=True)
+    return all_posts[:POSTS_PER_SUB]
+
+
+def fetch_arctic_comments(sub: str) -> list[dict]:
+    """
+    Fetch recent top comments for one subreddit from Arctic Shift.
+    Comments often contain ticker mentions that posts don't, especially
+    in megathreads and daily discussion threads.
+    """
+    now = int(time.time())
+    after = now - POST_LOOKBACK_DAYS * 86400
+    url = "https://arctic-shift.photon-reddit.com/api/comments/search"
+    base_params = {
+        "subreddit": sub,
+        "limit": 100,
+        "after": after,
+        "sort": "desc",
+    }
+    all_comments = []
+    seen_ids: set[str] = set()
+    cursor = None
+    max_pages = 2  # 2 * 100 = 200 comments
+
+    for _ in range(max_pages):
+        params = dict(base_params)
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            resp = _session.get(url, params=params, timeout=ARCTIC_TIMEOUT)
+            if resp.status_code in (400, 422) and cursor is None:
+                params.pop("after", None)
+                resp = _session.get(url, params=params, timeout=ARCTIC_TIMEOUT)
+            if resp.status_code != 200:
+                break
+            data = resp.json()
+        except requests.RequestException as e:
+            print(f"  [!] Arctic Shift comments error for r/{sub}: {e}", file=sys.stderr)
+            break
+
+        comments = data.get("data", [])
+        if not comments:
+            break
+        for c in comments:
+            cid = c.get("id")
+            if cid and cid not in seen_ids:
+                seen_ids.add(cid)
+                all_comments.append(c)
+        cursor = data.get("cursor")
+        if not cursor:
+            break
+        time.sleep(0.3)
+
+    all_comments.sort(key=lambda c: c.get("score", 0), reverse=True)
+    return all_comments[:COMMENTS_PER_SUB]
 
 
 def fetch_all_arctic_posts() -> dict[str, list[dict]]:
@@ -192,7 +300,16 @@ def fetch_all_arctic_posts() -> dict[str, list[dict]]:
     out: dict[str, list[dict]] = {}
     for sub in POST_SUBS:
         out[sub] = fetch_arctic_posts(sub)
-        time.sleep(0.5)
+        time.sleep(0.3)
+    return out
+
+
+def fetch_all_arctic_comments() -> dict[str, list[dict]]:
+    """Fetch comments for all configured COMMENT_SUBS."""
+    out: dict[str, list[dict]] = {}
+    for sub in COMMENT_SUBS:
+        out[sub] = fetch_arctic_comments(sub)
+        time.sleep(0.3)
     return out
 
 
@@ -323,106 +440,177 @@ def fetch_macro_indicators() -> dict[str, dict]:
 
 import re
 
-# Common WSB / stock-sub false-positives to filter out of bare-ticker matches
+# Common WSB / stock-sub false-positives to filter out of bare-ticker matches.
+# Expanded significantly to handle conversational text and comments.
 COMMON_FALSE_POSITIVES = {
-    "I", "A", "AN", "AT", "BE", "BY", "DO", "GO", "HE", "IF", "IN", "IS",
-    "IT", "ME", "MY", "NO", "OF", "OH", "OK", "ON", "OR", "SO", "TO", "UP",
-    "US", "WE", "ALL", "AND", "ARE", "BIG", "BUY", "CAN", "DD", "END", "ERA",
-    "FOR", "FUN", "GAIN", "GDP", "GET", "GOD", "GOT", "HAS", "HOD", "HOW",
-    "IMO", "IPO", "ITM", "LOSS", "LOW", "MAN", "MOM", "NEW", "NOT", "NOW",
-    "OLD", "ONE", "OTM", "OUT", "OWN", "PAY", "PE", "PER", "PUT", "RE",
-    "ROI", "RSI", "RUN", "SAY", "SEE", "SPY", "SOLD", "STONK", "STUDY",
-    "THE", "TOO", "TOP", "TRY", "USA", "USE", "VERY", "WANT", "WAS", "WAY",
-    "WIN", "WITH", "YOLO", "YOU", "YOUR", "MOON", "TICKER", "STOCK", "SHARES",
-    "PRICE", "TODAY", "WEEK", "YEAR", "GOOD", "BAD", "BEST", "HOPE", "FEEL",
-    "LOOK", "REAL", "LOVE", "HATE", "JUST", "LIKE", "MAKE", "MANY", "MUCH",
-    "OVER", "RIDE", "SOME", "THAN", "THAT", "THEM", "THEN", "THEY", "THIS",
-    "TIME", "WHAT", "WHEN", "WILL", "WORK", "YALL", "ETF", "CEO", "CFO",
-    "OTC", "ATH", "ATL", "FD", "DCA", "YOY", "QOQ", "EOD", "EOW", "EOY",
-    "FED", "FDX", "UPS", "PCE", "CPI", "PPI", "OPEC", "IIRC", "TBH", "IMO",
-    "ELI", "PSA", "HSA", "IRA", "RMD", "USD", "EUR", "GBP", "JPY", "CAD",
-    "AUD", "NYT", "WSJ", "CNBC", "BND", "DTE", "AMC", "CEO", "GDP",
-    "HOLD", "GAIN", "PUMP", "DUMP", "MOON", "RUG", "FUD", "FOMO", "BTD",
-    "ATH", "ATL", "BTD", "BTFD", "FD", "ITM", "OTM", "ATM", "DTE", "IV",
-    "IV", "OPRA", "MEME", "APE", "DIAMOND", "HANDS", "PAPER", "TENDIES",
-    "BAGHOLDER", "AUTIST", "SIR", "JACK", "POUND", "FLOOR", "CEILING",
+    # Single letters
+    "I", "A", "J", "K", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
+    # 2-3 letter common words / filler
+    "AN", "AT", "BE", "BY", "DO", "GO", "HE", "IF", "IN", "IS", "IT", "ME", "MY", "NO",
+    "OF", "OH", "OK", "ON", "OR", "SO", "TO", "UP", "US", "WE", "AM", "AS", "LA", "EL",
+    "ALL", "AND", "ARE", "BIG", "BUY", "CAN", "DID", "END", "FOR", "GOT", "HAS", "HAD",
+    "HER", "HIM", "HIS", "HOW", "ITS", "LET", "MAY", "NEW", "NOW", "OLD", "ONE", "OUR",
+    "OUT", "OWN", "PUT", "SAY", "SHE", "TOO", "TWO", "USE", "WAS", "WAY", "WHO", "WHY",
+    "YET", "YOU", "LOL", "OMG", "WTF", "IMO", "TBH", "ELI", "PSA", "TLDR", "IANAL",
+    "CEO", "CFO", "COO", "CTO", "CMO", "VP", "CRO", "HR", "PR", "OP", "PM", "AM", "FM",
+    # Common stock-market jargon that LOOKS like tickers
+    "ETF", "IPO", "ATH", "ATL", "ITM", "OTM", "ATM", "DTE", "IV", "DCA", "YOLO",
+    "FOMO", "FUD", "DD", "PT", "ER", "EPS", "PE", "ROE", "ROI", "RSI", "SMA", "EMA",
+    "MACD", "RSI", "VWAP", "OHLC", "PNL", "ATM", "OTM", "FD", "ITM", "DTE", "IV", "OI",
+    "GDP", "CPI", "PPI", "PCE", "FOMC", "OPEC", "SEC", "FED", "FDA", "CDC", "NSA",
+    "USA", "USD", "EUR", "GBP", "JPY", "CAD", "AUD", "CNY", "INR", "BTC", "ETH", "SOL",
+    "YTD", "QTD", "MTD", "YOY", "QOQ", "MOM", "EOD", "EOW", "EOY", "ATH", "ATL",
+    "IMO", "FYI", "IIRC", "TIL", "SMH", "WTF", "LMK", "OP", "TLDR", "BFD",
+    "WSB", "DD", "OP", "PT", "ER", "EPS", "TA", "FA", "HODL", "FOMO", "BTFD", "BTD",
+    # Conversational / casual chat words (from comment analysis)
+    "DAMN", "DUMB", "REAL", "SURE", "COOL", "NICE", "WELL", "JUST", "LIKE", "MAKE",
+    "MANY", "MUCH", "OVER", "RIDE", "SOME", "THAN", "THAT", "THEM", "THEN", "THEY",
+    "THIS", "TIME", "WHAT", "WHEN", "WILL", "WORK", "YALL", "GUYS", "DAYS", "DAYS",
+    "SHIT", "FUCK", "DUDE", "BRO", "MAN", "GUY", "FEEL", "LOOK", "LOVE", "HATE",
+    "HOPE", "BEST", "GOOD", "BAD", "LOSE", "WON", "TOLD", "TELL", "SAID", "SEND",
+    "HELP", "STOP", "KEEP", "HOLD", "WAIT", "WANT", "NEED", "MADE", "MAKE", "TAKE",
+    "GIVE", "FIND", "CALL", "KNOW", "SHOW", "PLAY", "RUN", "MOVE", "LIVE", "BELIEVE",
+    "MOST", "ONLY", "THAN", "MUCH", "MORE", "LESS", "VERY", "EVEN", "BACK", "DOWN",
+    "FROM", "WITH", "HAVE", "THIS", "THAT", "WHAT", "WHICH", "THEIR", "THERE", "WHERE",
+    "ALSO", "JUST", "BEEN", "STILL", "GOING", "STAY", "LEFT", "RIGHT", "BEING", "REALLY",
+    "DA", "DAYS", "WEEK", "YEAR", "MTH", "HR", "MIN", "SEC", "LOT", "BIT", "NEXT",
+    "LAST", "PAST", "SAME", "OTHER", "FEW", "MANY", "REAL", "FULL", "BEST", "LONG",
+    "OPEN", "HIGH", "LOW", "CLOSE", "BUY", "SELL", "HOLD", "GAIN", "LOSS", "ROI",
+    "PR", "CEO", "CTO", "IT", "DEV", "JR", "SR", "OK", "NO", "YES", "MAYBE",
+    "FANG", "ETF", "REIT", "YOLO", "WSB", "OP", "PT", "TA", "FA", "DD", "ER", "EPS",
+    "ATH", "ATL", "BAG", "MOON", "ROCKET", "DIAMOND", "HANDS", "PAPER", "TENDIES",
+    "WALL", "STREET", "STONKS", "MEME", "APE", "BAGHOLDER", "SIR", "JACK", "POUND",
+    "FLOOR", "CEILING", "GAP", "UP", "DOWN", "DIP", "RALLY", "PUMP", "DUMP", "RUG",
+    # Words that show up a lot in WSB-speak
+    "TITS", "CUM", "ASS", "PUSSY", "DICK",  # crude but real WSB slang
+    "PUMP", "DUMP", "MOON", "RUG", "FUD", "FOMO", "SHILL", "BTD", "BTFD", "FD",
+    "YOLO", "FOMO", "ATH", "ATL", "ITM", "OTM", "ATM", "DTE", "IV", "OI", "VWAP",
 }
 
 
 def extract_tickers(text: str) -> set[str]:
-    """Extract stock ticker mentions from text. Returns a set of uppercase tickers."""
+    """
+    Extract stock ticker mentions from text. Returns a set of uppercase tickers.
+
+    Two-stage extraction:
+    1. Cashtags ($TSLA) - very high confidence, always included
+    2. Bare UPPERCASE words - included only if they pass the false-positive filter
+    """
     if not text:
         return set()
     found = set()
-    # $TICKER form
+    # Stage 1: $TICKER form (very high confidence)
     found.update(re.findall(r"\$([A-Z]{1,5})\b", text))
-    # Bare UPPERCASE words (2-5 chars, longer than 1 to reduce noise)
+    # Stage 2: Bare UPPERCASE words (2-5 chars) - only if they pass the filter
+    # We require word boundaries and skip common conversational false-positives
     bare = re.findall(r"\b([A-Z]{2,5})\b", text)
-    found.update(bare)
-    return {t for t in found if t not in COMMON_FALSE_POSITIVES and not t.isdigit()}
+    for word in bare:
+        if word in COMMON_FALSE_POSITIVES:
+            continue
+        # Skip if the word is all one letter repeated (AAAA, etc.)
+        if len(set(word)) == 1:
+            continue
+        found.add(word)
+    return found
 
 
-def build_ticker_post_index(posts: list[dict]) -> dict[str, list[dict]]:
+def build_ticker_post_index(
+    posts: list[dict],
+    comments: list[dict] | None = None,
+) -> dict[str, list[dict]]:
     """
-    Build a {ticker: [post, ...]} index from a list of posts.
-    Posts are scanned for tickers in both title and body.
-    Sorted by score (highest first), with a small cap to keep memory bounded.
+    Build a {ticker: [post, ...]} index from posts (and optionally comments).
+    Posts and comments are scanned for tickers in both title and body.
+    Sorted by adjusted score (specificity-weighted), with a small cap.
 
-    Also tracks 'post ticker breadth' — how many tickers a post mentions —
+    Also tracks 'post ticker breadth' — how many tickers a post/comment mentions —
     so we can filter out 'list posts' (e.g. a market roundup that mentions
     10 tickers in passing) which aren't actually a 'why this is trending'.
-    Posts that only mention 1-2 tickers are weighted higher (more specific).
     """
-    # Pass 1: count how many tickers each post mentions
-    post_ticker_count: dict[str, int] = {}
-    post_to_tickers: dict[str, set[str]] = {}
-    for p in posts:
-        text = f"{p.get('title', '')} {p.get('selftext', '')[:2000]}"
+    # Combine posts and comments. Comments have lower engagement, so we score
+    # them at 0.3x a post to reflect they're more conversational.
+    all_items: list[tuple[dict, float]] = [(p, 1.0) for p in posts]
+    if comments:
+        all_items.extend((c, 0.3) for c in comments)
+
+    # Pass 1: count how many tickers each item mentions
+    item_ticker_count: dict[str, int] = {}
+    item_to_tickers: dict[str, set[str]] = {}
+    item_score_mult: dict[str, float] = {}
+    for item, mult in all_items:
+        # Posts use title + selftext; comments use body
+        if "body" in item and "selftext" not in item:
+            # comment
+            text = f"{item.get('body', '') or ''}"
+        else:
+            # post
+            text = f"{item.get('title', '')} {item.get('selftext', '')[:POST_BODY_EXTRACT_CHARS]}"
         tickers = extract_tickers(text)
         if tickers:
-            pid = p.get("id", "")
-            post_to_tickers[pid] = tickers
-            post_ticker_count[pid] = len(tickers)
+            iid = item.get("id", "")
+            item_to_tickers[iid] = tickers
+            item_ticker_count[iid] = len(tickers)
+            item_score_mult[iid] = mult
 
-    # Pass 2: build the index, skipping "list posts" (mention >= 7 tickers)
-    # and low-quality posts (score < 3)
-    # Posts that mention fewer tickers get a boost so they appear first
-    # (they're more likely to be specifically about that ticker)
+    # Pass 2: build the index with quality filters
     index: dict[str, list[dict]] = {}
     cap = 10
     MIN_SCORE = 3
-    MAX_BREADTH = 7    # only filter out the broadest roundup posts
-    for p in posts:
-        pid = p.get("id", "")
-        breadth = post_ticker_count.get(pid, 0)
+    MAX_BREADTH = 7
+
+    for item, mult in all_items:
+        iid = item.get("id", "")
+        breadth = item_ticker_count.get(iid, 0)
         if breadth >= MAX_BREADTH:
             continue
-        score = p.get("score", 0)
-        if score < MIN_SCORE:
+        score = item.get("score", 0) or 0
+        # Comments need lower threshold since they don't have "posts" worth of upvotes
+        effective_min_score = 1 if mult < 1 else MIN_SCORE
+        if score < effective_min_score:
             continue
-        tickers = post_to_tickers.get(pid, set())
+        tickers = item_to_tickers.get(iid, set())
         if not tickers:
             continue
         # Specificity boost: posts that mention fewer tickers rank higher
-        # (e.g. "TSLA hits new high" is better than "market roundup mentions TSLA")
-        # Divide score by breadth — so a 100-score 1-ticker post beats a 100-score 5-ticker post
-        adjusted_score = score / max(breadth, 1)
-        slim = {
-            "id": pid,
-            "subreddit": p.get("subreddit", ""),
-            "title": (p.get("title") or "")[:200],
-            "score": score,
-            "breadth": breadth,
-            "num_comments": p.get("num_comments", 0),
-            "permalink": f"https://reddit.com{p.get('permalink', '')}",
-            "author": p.get("author", "[deleted]"),
-        }
+        adjusted_score = (score * mult) / max(breadth, 1)
+        # Posts and comments have different shapes - normalize to one
+        if "body" in item and "selftext" not in item:
+            # it's a comment
+            permalink = item.get("permalink", "")
+            # comments need /r/.../comments/ID/title/IDc/
+            if permalink and not permalink.startswith("http"):
+                full_permalink = f"https://reddit.com{permalink}"
+            else:
+                full_permalink = f"https://reddit.com{permalink}"
+            slim = {
+                "id": iid,
+                "subreddit": item.get("subreddit", ""),
+                "title": (item.get("body", "") or "")[:200],  # comments don't have titles
+                "score": score,
+                "breadth": breadth,
+                "num_comments": 0,
+                "permalink": full_permalink,
+                "author": item.get("author", "[deleted]"),
+                "is_comment": True,
+            }
+        else:
+            # it's a post
+            slim = {
+                "id": iid,
+                "subreddit": item.get("subreddit", ""),
+                "title": (item.get("title") or "")[:200],
+                "score": score,
+                "breadth": breadth,
+                "num_comments": item.get("num_comments", 0),
+                "permalink": f"https://reddit.com{item.get('permalink', '')}",
+                "author": item.get("author", "[deleted]"),
+                "is_comment": False,
+            }
         for t in tickers:
             bucket = index.setdefault(t, [])
             if len(bucket) < cap:
-                # Use a tuple (adjusted_score, raw_score) for sorting
                 bucket.append((adjusted_score, slim))
-    # Sort each bucket by adjusted score desc, then raw score desc, drop the key
+    # Sort by adjusted score desc, then raw score desc
     for ticker in index:
         index[ticker] = [
             slim for _, slim in sorted(
@@ -495,9 +683,12 @@ def build_dashboard_payload() -> dict:
     # Default dashboard prices are 1mo (the initial render)
     prices = price_caches["1mo"].get(lambda: fetch_yahoo_prices(stock_tickers, "1mo"))
 
-    # Build the per-ticker post index from all fetched posts
+    # Build the per-ticker post index from all fetched posts + comments
     all_posts_flat = [p for sub_posts in posts_by_sub.values() for p in sub_posts]
-    full_ticker_index = build_ticker_post_index(all_posts_flat)
+    # Comments: fetch from a separate config of subs (smaller set for performance)
+    comments_by_sub = fetch_all_arctic_comments()
+    all_comments_flat = [c for sub_comments in comments_by_sub.values() for c in sub_comments]
+    full_ticker_index = build_ticker_post_index(all_posts_flat, all_comments_flat)
 
     # Fetch macro indicators (cached separately for 15 min)
     macro = macro_cache.get(fetch_macro_indicators)
@@ -636,6 +827,7 @@ def build_ticker_detail(ticker: str) -> dict:
     upper = ticker.upper().lstrip("$")
     tickers_by_sub = fetch_apewisdom_tickers()
     posts_by_sub = fetch_all_arctic_posts()
+    comments_by_sub = fetch_all_arctic_comments()
 
     # Per-sub stats
     latest = []
@@ -652,16 +844,16 @@ def build_ticker_detail(ticker: str) -> dict:
                 })
                 break
 
-    # Use the per-ticker post index for richer post coverage
+    # Use the per-ticker post index (which now includes comments) for richer coverage
     all_posts_flat = [p for sub_posts in posts_by_sub.values() for p in sub_posts]
-    full_ticker_index = build_ticker_post_index(all_posts_flat)
+    all_comments_flat = [c for sub_comments in comments_by_sub.values() for c in sub_comments]
+    full_ticker_index = build_ticker_post_index(all_posts_flat, all_comments_flat)
     posts = full_ticker_index.get(upper, [])[:30]
 
     return {
         "ticker": upper,
         "latest_per_sub": sorted(latest, key=lambda x: x.get("mentions", 0) or 0, reverse=True),
         "recent_posts": posts,
-        # 7-day trend unavailable in this stateless design (would need a DB)
         "trend_7d": [],
     }
 
@@ -1247,7 +1439,12 @@ function renderTickerCard(t, opts = {}) {
           return `
             <a class="why-post" href="${post.permalink}" target="_blank" rel="noopener">
               ${escapeHtml(title)}
-              <div class="meta">r/${escapeHtml(post.subreddit)} · <span class="score-num">▲ ${post.score}</span></div>
+              <div class="meta">
+                ${post.is_comment ? '💬' : '📝'}
+                r/${escapeHtml(post.subreddit)} ·
+                <span class="score-num">▲ ${post.score}</span>
+                ${post.is_comment ? ' · comment' : ''}
+              </div>
             </a>
           `;
         }).join('')}
