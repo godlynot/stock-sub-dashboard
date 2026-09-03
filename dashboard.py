@@ -1087,6 +1087,59 @@ TEMPLATE = r"""
   .modal-content { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 20px; max-width: 600px; width: 100%; max-height: 80vh; overflow-y: auto; }
   .modal-close { float: right; cursor: pointer; color: var(--muted); font-size: 24px; line-height: 1; }
   .modal-close:hover { color: var(--text); }
+  .modal-header-link {
+    text-align: right;
+    margin-bottom: 8px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  .modal-header-link a {
+    font-size: 11px;
+    color: var(--accent);
+    text-decoration: none;
+  }
+  .modal-header-link a:hover { text-decoration: underline; }
+
+  /* ----- Dedicated ticker page ----- */
+  .ticker-hero {
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+    padding: 8px 0 16px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 8px;
+    flex-wrap: wrap;
+  }
+  .ticker-hero .hero-sym {
+    font-size: 28px;
+    font-weight: 700;
+    color: var(--accent);
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  .ticker-hero .hero-price {
+    font-size: 24px;
+    font-weight: 600;
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+  }
+  .ticker-hero .hero-change {
+    font-size: 14px;
+    font-weight: 600;
+    padding: 3px 8px;
+    border-radius: 4px;
+    font-variant-numeric: tabular-nums;
+  }
+  .ticker-hero .hero-change.up { color: var(--green); background: rgba(63, 185, 80, 0.15); }
+  .ticker-hero .hero-change.down { color: var(--red); background: rgba(248, 81, 73, 0.15); }
+  .ticker-hero .hero-change.flat { color: var(--muted); background: rgba(139, 148, 158, 0.15); }
+  .back-link {
+    display: inline-block;
+    margin-bottom: 14px;
+    color: var(--accent);
+    text-decoration: none;
+    font-size: 13px;
+  }
+  .back-link:hover { text-decoration: underline; }
   .loading { text-align: center; padding: 40px; color: var(--muted); }
   .stat-line { display: flex; justify-content: space-between; padding: 4px 0; font-size: 13px; }
   .stat-line .lbl { color: var(--muted); }
@@ -1772,24 +1825,43 @@ async function openTicker(ticker) {
       document.getElementById('modal-body').innerHTML = `<div class="empty">${escapeHtml(data.error)}</div>`;
       return;
     }
-    document.getElementById('modal-body').innerHTML = renderTickerModal(data);
+    // Add "open full page" link in the modal header
+    document.getElementById('modal-body').innerHTML =
+      `<div class="modal-header-link"><a href="/ticker/${encodeURIComponent(ticker)}" target="_blank">↗ Open full page</a></div>` +
+      renderTickerDetailHTML(data);
   } catch (e) {
     document.getElementById('modal-body').innerHTML = '<div class="empty">Error loading.</div>';
   }
 }
 
-function renderTickerModal(data) {
+function renderTickerDetailHTML(data) {
   const latest = data.latest_per_sub;
   const posts = data.recent_posts;
-  let html = `<h2 style="margin-top:0;">$${data.ticker}</h2>`;
+  const prices = dashboardData && dashboardData.prices ? dashboardData.prices[data.ticker] : null;
+  let html = '';
+
+  // Price + change at the top of the detail view (only on the dedicated page;
+  // the modal already has it visible from the underlying card)
+  if (prices) {
+    const dir = prices.change_pct > 0.05 ? 'up' : prices.change_pct < -0.05 ? 'down' : 'flat';
+    html += `
+      <div class="ticker-hero">
+        <div class="hero-sym">$${escapeHtml(data.ticker)}</div>
+        <div class="hero-price">$${prices.price.toFixed(2)}</div>
+        <div class="hero-change ${dir}">${prices.change_pct > 0 ? '+' : ''}${prices.change_pct.toFixed(2)}%</div>
+      </div>
+    `;
+  } else {
+    html += `<h2 style="margin-top:0;">$${escapeHtml(data.ticker)}</h2>`;
+  }
 
   if (latest.length > 0) {
-    html += `<div style="margin-top:14px;"><strong style="color:var(--muted);font-size:12px;text-transform:uppercase;">By Subreddit (latest)</strong>`;
+    html += `<div style="margin-top:18px;"><strong style="color:var(--muted);font-size:12px;text-transform:uppercase;">By Subreddit (latest)</strong>`;
     latest.forEach(l => {
       const delta = l.mentions_24h_ago != null ? (l.mentions - l.mentions_24h_ago) : null;
       html += `
         <div class="row">
-          <span class="lbl">r/${l.subreddit}</span>
+          <span class="lbl">r/${escapeHtml(l.subreddit)}</span>
           <span class="val">
             ${l.mentions} mentions
             ${delta != null
@@ -1807,17 +1879,19 @@ function renderTickerModal(data) {
   }
 
   if (posts.length > 0) {
-    html += `<div style="margin-top:14px;"><strong style="color:var(--muted);font-size:12px;text-transform:uppercase;">Recent Posts (${posts.length})</strong>`;
-    posts.slice(0, 10).forEach(p => {
+    html += `<div style="margin-top:18px;"><strong style="color:var(--muted);font-size:12px;text-transform:uppercase;">Recent Posts (${posts.length})</strong>`;
+    posts.slice(0, 20).forEach(p => {
+      const isComment = p.is_comment;
       html += `
         <div class="post">
           <a class="post-title" href="${p.permalink}" target="_blank" rel="noopener">
             ${escapeHtml(p.title)}
           </a>
           <div class="post-meta">
-            <span class="sub">r/${p.subreddit}</span>
+            ${isComment ? '💬' : '📝'}
+            r/${escapeHtml(p.subreddit)} ·
             <span class="score">▲ ${p.score}</span>
-            <span>💬 ${p.num_comments}</span>
+            ${!isComment ? `· 💬 ${p.num_comments || 0}` : ' · comment'}
           </div>
         </div>
       `;
@@ -1845,6 +1919,244 @@ loadData();
 @app.route("/")
 def index():
     return render_template_string(TEMPLATE)
+
+
+# ----------------------------------------------------------------------------
+# Dedicated /ticker/<T> page
+# ----------------------------------------------------------------------------
+
+# Same as TEMPLATE but without the dashboard grid, with a ticker detail body
+TICKER_PAGE_TEMPLATE = r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>__TICKER__ — Stock Sub Dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel-2: #1c2128;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --red: #f85149;
+    --gold: #d29922;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  header {
+    padding: 18px 20px;
+    background: linear-gradient(135deg, #1f6feb 0%, #58a6ff 100%);
+    box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+  }
+  h1 { margin: 0 0 4px 0; font-size: 22px; }
+  .subtitle { color: rgba(255,255,255,0.85); font-size: 13px; }
+  main { padding: 16px 20px 60px; max-width: 800px; margin: 0 auto; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .row { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--border); gap: 10px; }
+  .row:last-child { border-bottom: none; }
+  .row .lbl { color: var(--text); }
+  .row .val { color: var(--accent); font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .delta-up { color: var(--green); font-size: 11px; }
+  .delta-down { color: var(--red); font-size: 11px; }
+  .post { padding: 12px 0; border-bottom: 1px solid var(--border); }
+  .post:last-child { border-bottom: none; }
+  .post-title { font-size: 15px; font-weight: 500; color: var(--text); text-decoration: none; display: block; margin-bottom: 6px; line-height: 1.4; }
+  .post-title:hover { color: var(--accent); }
+  .post-meta { font-size: 12px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 8px; }
+  .post-meta .sub { color: var(--accent); font-weight: 500; }
+  .post-meta .score { color: var(--green); }
+  .ticker-hero {
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+    padding: 8px 0 16px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 8px;
+    flex-wrap: wrap;
+  }
+  .ticker-hero .hero-sym {
+    font-size: 28px;
+    font-weight: 700;
+    color: var(--accent);
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  .ticker-hero .hero-price {
+    font-size: 24px;
+    font-weight: 600;
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+  }
+  .ticker-hero .hero-change {
+    font-size: 14px;
+    font-weight: 600;
+    padding: 3px 8px;
+    border-radius: 4px;
+    font-variant-numeric: tabular-nums;
+  }
+  .ticker-hero .hero-change.up { color: var(--green); background: rgba(63, 185, 80, 0.15); }
+  .ticker-hero .hero-change.down { color: var(--red); background: rgba(248, 81, 73, 0.15); }
+  .ticker-hero .hero-change.flat { color: var(--muted); background: rgba(139, 148, 158, 0.15); }
+  .back-link {
+    display: inline-block;
+    margin-bottom: 14px;
+    color: var(--accent);
+    text-decoration: none;
+    font-size: 13px;
+  }
+  .back-link:hover { text-decoration: underline; }
+  .empty { color: var(--muted); font-style: italic; padding: 20px 0; text-align: center; }
+  .loading { text-align: center; padding: 40px; color: var(--muted); }
+  .footer { text-align: center; color: var(--muted); font-size: 11px; padding: 20px; border-top: 1px solid var(--border); margin-top: 30px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>📈 __TICKER__</h1>
+  <div class="subtitle">Stock Sub Dashboard</div>
+</header>
+
+<main>
+  <a href="/" class="back-link">← Back to dashboard</a>
+  <div class="card" id="ticker-content">
+    <div class="loading">Loading...</div>
+  </div>
+</main>
+
+<div class="footer">
+  Data: ApeWisdom + Arctic Shift + Yahoo Finance. Not financial advice.
+</div>
+
+<script>
+let dashboardData = null;
+
+function escapeHtml(s) {
+  if (s == null) return '';
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+function renderTickerDetailHTML(data) {
+  const latest = data.latest_per_sub;
+  const posts = data.recent_posts;
+  const prices = dashboardData && dashboardData.prices ? dashboardData.prices[data.ticker] : null;
+  let html = '';
+
+  if (prices) {
+    const dir = prices.change_pct > 0.05 ? 'up' : prices.change_pct < -0.05 ? 'down' : 'flat';
+    html += `
+      <div class="ticker-hero">
+        <div class="hero-sym">$${escapeHtml(data.ticker)}</div>
+        <div class="hero-price">$${prices.price.toFixed(2)}</div>
+        <div class="hero-change ${dir}">${prices.change_pct > 0 ? '+' : ''}${prices.change_pct.toFixed(2)}%</div>
+      </div>
+    `;
+  } else {
+    html += `<h2 style="margin-top:0;">$${escapeHtml(data.ticker)}</h2>`;
+  }
+
+  if (latest.length > 0) {
+    html += `<div style="margin-top:18px;"><strong style="color:var(--muted);font-size:12px;text-transform:uppercase;">By Subreddit (latest)</strong>`;
+    latest.forEach(l => {
+      const delta = l.mentions_24h_ago != null ? (l.mentions - l.mentions_24h_ago) : null;
+      html += `
+        <div class="row">
+          <span class="lbl">r/${escapeHtml(l.subreddit)}</span>
+          <span class="val">
+            ${l.mentions} mentions
+            ${delta != null
+              ? (delta > 0
+                  ? `<span class="delta-up">▲${delta}</span>`
+                  : delta < 0
+                    ? `<span class="delta-down">▼${Math.abs(delta)}</span>`
+                    : '')
+              : ''}
+          </span>
+        </div>
+      `;
+    });
+    html += `</div>`;
+  }
+
+  if (posts.length > 0) {
+    html += `<div style="margin-top:18px;"><strong style="color:var(--muted);font-size:12px;text-transform:uppercase;">Recent Posts (${posts.length})</strong>`;
+    posts.slice(0, 30).forEach(p => {
+      const isComment = p.is_comment;
+      html += `
+        <div class="post">
+          <a class="post-title" href="${p.permalink}" target="_blank" rel="noopener">
+            ${escapeHtml(p.title)}
+          </a>
+          <div class="post-meta">
+            ${isComment ? '💬' : '📝'}
+            r/${escapeHtml(p.subreddit)} ·
+            <span class="score">▲ ${p.score}</span>
+            ${!isComment ? `· 💬 ${p.num_comments || 0}` : ' · comment'}
+          </div>
+        </div>
+      `;
+    });
+    html += `</div>`;
+  }
+
+  if (latest.length === 0 && posts.length === 0) {
+    html += '<div class="empty">No data for this ticker right now.</div>';
+  }
+  return html;
+}
+
+async function loadTicker() {
+  const ticker = '__TICKER__';
+  try {
+    // Load prices in background (for hero)
+    fetch('/api/stats').then(r => r.json()).then(d => { dashboardData = d; refreshHero(); });
+    // Load ticker details
+    const resp = await fetch(`/api/ticker/${encodeURIComponent(ticker)}`);
+    const data = await resp.json();
+    if (data.error) {
+      document.getElementById('ticker-content').innerHTML = `<div class="empty">${escapeHtml(data.error)}</div>`;
+      return;
+    }
+    window._tickerData = data;
+    document.getElementById('ticker-content').innerHTML = renderTickerDetailHTML(data);
+  } catch (e) {
+    document.getElementById('ticker-content').innerHTML = '<div class="empty">Error loading.</div>';
+  }
+}
+
+function refreshHero() {
+  // Re-render once prices arrive so the hero appears
+  if (window._tickerData) {
+    document.getElementById('ticker-content').innerHTML = renderTickerDetailHTML(window._tickerData);
+  }
+}
+
+loadTicker();
+</script>
+</body>
+</html>
+"""
+
+
+@app.route("/ticker/<ticker>")
+def ticker_page(ticker: str):
+    """Dedicated page for a single ticker. Shareable, mobile-friendly."""
+    safe = ticker.upper().lstrip("$")[:10]  # sanitize
+    return render_template_string(
+        TICKER_PAGE_TEMPLATE.replace("__TICKER__", safe)
+    )
 
 
 # ----------------------------------------------------------------------------
