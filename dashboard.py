@@ -122,33 +122,35 @@ def fetch_yahoo_prices(tickers: list[str], timeframe: str = "1mo") -> dict[str, 
     Fetch price + history for a list of tickers from Yahoo Finance.
     Returns {ticker: {price, prev_close, change_pct, currency, name,
                        sparkline: [...closes...]}}
-    Missing tickers get an empty dict (or just absent from result).
+    Uses thread pool of 8 workers to parallelize the 100+ sequential calls.
+    Yahoo Finance is the main bottleneck (was 20+ seconds sequential).
     """
+    import concurrent.futures
     out: dict[str, dict] = {}
     interval, range_ = TIMEFRAMES.get(timeframe, TIMEFRAMES["1mo"])
-    for ticker in tickers:
+
+    def _fetch_one(ticker: str) -> tuple[str, dict | None]:
         try:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
             params = {"interval": interval, "range": range_}
             resp = _yahoo_session.get(url, params=params, timeout=YAHOO_TIMEOUT)
             if resp.status_code != 200:
-                continue
+                return ticker, None
             data = resp.json()
             chart = data.get("chart", {}).get("result", [None])[0]
             if not chart:
-                continue
+                return ticker, None
             meta = chart.get("meta", {})
             price = meta.get("regularMarketPrice")
             prev = meta.get("chartPreviousClose") or meta.get("previousClose")
             if price is None:
-                continue
+                return ticker, None
             change_pct = ((price - prev) / prev * 100) if prev else 0
             closes = (
                 chart.get("indicators", {}).get("quote", [{}])[0].get("close", [])
             )
-            # Filter out None values that Yahoo sometimes returns
             sparkline = [round(c, 2) for c in closes if c is not None]
-            out[ticker] = {
+            return ticker, {
                 "price": round(price, 2),
                 "prev_close": round(prev, 2) if prev else None,
                 "change_pct": round(change_pct, 2),
@@ -158,8 +160,14 @@ def fetch_yahoo_prices(tickers: list[str], timeframe: str = "1mo") -> dict[str, 
                 "timeframe": timeframe,
             }
         except Exception as e:
-            print(f"[yahoo] error for {ticker}: {e}", flush=True)
-            continue
+            return ticker, None
+
+    # Parallel fetch with 8 workers (Yahoo's rate limit is ~2000/hr, 8 concurrent is safe)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        results = list(ex.map(_fetch_one, tickers))
+    for ticker, data in results:
+        if data:
+            out[ticker] = data
     return out
 
 
@@ -184,12 +192,42 @@ def fetch_apewisdom_tickers() -> dict[str, list[dict]]:
     return out
 
 
-def fetch_arctic_posts(sub: str) -> list[dict]:
+def _arctic_get_with_retry(url: str, params: dict, max_attempts: int = 3, timeout: int = ARCTIC_TIMEOUT) -> tuple[dict | None, str | None]:
+    """
+    GET from Arctic Shift with automatic retry on 422/429/5xx.
+    Returns (data, error_message). error_message is None on success.
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = _session.get(url, params=params, timeout=timeout)
+            if resp.status_code in (400, 422) and "after" in params:
+                # Server doesn't accept after+sort combo. Try without date filter.
+                params = {k: v for k, v in params.items() if k not in ("after", "before")}
+                resp = _session.get(url, params=params, timeout=timeout)
+            if resp.status_code == 429:
+                # Rate limited - back off exponentially
+                wait = min(2 ** attempt, 8)
+                time.sleep(wait)
+                continue
+            if resp.status_code in (500, 502, 503, 504):
+                if attempt < max_attempts:
+                    time.sleep(1)
+                    continue
+            resp.raise_for_status()
+            return resp.json(), None
+        except requests.RequestException as e:
+            if attempt < max_attempts:
+                time.sleep(1)
+                continue
+            return None, str(e)
+    return None, "max retries exceeded"
+
+
+def fetch_arctic_posts(sub: str) -> tuple[list[dict], str | None]:
     """
     Fetch recent top posts for one subreddit from Arctic Shift.
     Paginated up to 3 pages (300 posts max) to increase coverage.
-    Arctic Shift doesn't support sort=score, so we pull the latest
-    posts and sort by score client-side.
+    Returns (posts, error_message). error_message is None on success.
     """
     now = int(time.time())
     after = now - POST_LOOKBACK_DAYS * 86400
@@ -203,22 +241,18 @@ def fetch_arctic_posts(sub: str) -> list[dict]:
     all_posts = []
     seen_ids: set[str] = set()
     cursor = None
-    max_pages = 3  # 3 * 100 = 300 posts
+    max_pages = 3
+    last_error = None
 
     for _ in range(max_pages):
         params = dict(base_params)
         if cursor:
             params["cursor"] = cursor
-        try:
-            resp = _session.get(url, params=params, timeout=ARCTIC_TIMEOUT)
-            if resp.status_code in (400, 422) and cursor is None:
-                params.pop("after", None)
-                resp = _session.get(url, params=params, timeout=ARCTIC_TIMEOUT)
-            if resp.status_code != 200:
-                break
-            data = resp.json()
-        except requests.RequestException as e:
-            print(f"  [!] Arctic Shift error for r/{sub}: {e}", file=sys.stderr)
+        data, err = _arctic_get_with_retry(url, params)
+        if err:
+            last_error = err
+            break
+        if not data:
             break
 
         posts = data.get("data", [])
@@ -239,14 +273,13 @@ def fetch_arctic_posts(sub: str) -> list[dict]:
         time.sleep(0.3)
 
     all_posts.sort(key=lambda p: p.get("score", 0), reverse=True)
-    return all_posts[:POSTS_PER_SUB]
+    return all_posts[:POSTS_PER_SUB], last_error
 
 
-def fetch_arctic_comments(sub: str) -> list[dict]:
+def fetch_arctic_comments(sub: str) -> tuple[list[dict], str | None]:
     """
     Fetch recent top comments for one subreddit from Arctic Shift.
-    Comments often contain ticker mentions that posts don't, especially
-    in megathreads and daily discussion threads.
+    Returns (comments, error_message).
     """
     now = int(time.time())
     after = now - POST_LOOKBACK_DAYS * 86400
@@ -260,22 +293,18 @@ def fetch_arctic_comments(sub: str) -> list[dict]:
     all_comments = []
     seen_ids: set[str] = set()
     cursor = None
-    max_pages = 2  # 2 * 100 = 200 comments
+    max_pages = 2
+    last_error = None
 
     for _ in range(max_pages):
         params = dict(base_params)
         if cursor:
             params["cursor"] = cursor
-        try:
-            resp = _session.get(url, params=params, timeout=ARCTIC_TIMEOUT)
-            if resp.status_code in (400, 422) and cursor is None:
-                params.pop("after", None)
-                resp = _session.get(url, params=params, timeout=ARCTIC_TIMEOUT)
-            if resp.status_code != 200:
-                break
-            data = resp.json()
-        except requests.RequestException as e:
-            print(f"  [!] Arctic Shift comments error for r/{sub}: {e}", file=sys.stderr)
+        data, err = _arctic_get_with_retry(url, params)
+        if err:
+            last_error = err
+            break
+        if not data:
             break
 
         comments = data.get("data", [])
@@ -292,25 +321,52 @@ def fetch_arctic_comments(sub: str) -> list[dict]:
         time.sleep(0.3)
 
     all_comments.sort(key=lambda c: c.get("score", 0), reverse=True)
-    return all_comments[:COMMENTS_PER_SUB]
+    return all_comments[:COMMENTS_PER_SUB], last_error
 
 
-def fetch_all_arctic_posts() -> dict[str, list[dict]]:
-    """Fetch posts for all configured POST_SUBS."""
+def fetch_all_arctic_posts_parallel() -> tuple[dict[str, list[dict]], dict[str, str]]:
+    """
+    Fetch posts for all configured POST_SUBS in parallel.
+    Arctic Shift rate-limits aggressively, so we use a small thread pool
+    (4 workers) to keep concurrent requests reasonable.
+    Returns (posts_by_sub, errors).
+    """
+    import concurrent.futures
     out: dict[str, list[dict]] = {}
-    for sub in POST_SUBS:
-        out[sub] = fetch_arctic_posts(sub)
-        time.sleep(0.3)
-    return out
+    errors: dict[str, str] = {}
+
+    def _fetch_one(sub: str) -> tuple[str, list[dict], str | None]:
+        posts, err = fetch_arctic_posts(sub)
+        return sub, posts, err
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+        futures = [ex.submit(_fetch_one, sub) for sub in POST_SUBS]
+        for fut in concurrent.futures.as_completed(futures):
+            sub, posts, err = fut.result()
+            out[sub] = posts
+            if err:
+                errors[sub] = err
+    return out, errors
 
 
-def fetch_all_arctic_comments() -> dict[str, list[dict]]:
-    """Fetch comments for all configured COMMENT_SUBS."""
+def fetch_all_arctic_comments_parallel() -> tuple[dict[str, list[dict]], dict[str, str]]:
+    """Fetch comments for all configured COMMENT_SUBS in parallel."""
+    import concurrent.futures
     out: dict[str, list[dict]] = {}
-    for sub in COMMENT_SUBS:
-        out[sub] = fetch_arctic_comments(sub)
-        time.sleep(0.3)
-    return out
+    errors: dict[str, str] = {}
+
+    def _fetch_one(sub: str) -> tuple[str, list[dict], str | None]:
+        comments, err = fetch_arctic_comments(sub)
+        return sub, comments, err
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+        futures = [ex.submit(_fetch_one, sub) for sub in COMMENT_SUBS]
+        for fut in concurrent.futures.as_completed(futures):
+            sub, comments, err = fut.result()
+            out[sub] = comments
+            if err:
+                errors[sub] = err
+    return out, errors
 
 
 # ----------------------------------------------------------------------------
@@ -493,17 +549,24 @@ def extract_tickers(text: str) -> set[str]:
     Extract stock ticker mentions from text. Returns a set of uppercase tickers.
 
     Two-stage extraction:
-    1. Cashtags ($TSLA) - very high confidence, always included
-    2. Bare UPPERCASE words - included only if they pass the false-positive filter
+    1. Strip code blocks (```...``` and inline `code`) to avoid false positives
+       like print($NVDA) or function names
+    2. Cashtags ($TSLA) - very high confidence, always included
+    3. Bare UPPERCASE words - included only if they pass the false-positive filter
     """
     if not text:
         return set()
+    # Strip code blocks: ```...```, `...`, and indented blocks
+    cleaned = re.sub(r"```[\s\S]*?```", " ", text)         # fenced code blocks
+    cleaned = re.sub(r"`[^`\n]+`", " ", cleaned)             # inline code
+    cleaned = re.sub(r"(?m)^[ \t]+.*$", " ", cleaned)     # indented lines
+    cleaned = re.sub(r"(?m)^>.*$", " ", cleaned)          # block quotes
     found = set()
     # Stage 1: $TICKER form (very high confidence)
-    found.update(re.findall(r"\$([A-Z]{1,5})\b", text))
+    found.update(re.findall(r"\$([A-Z]{1,5})\b", cleaned))
     # Stage 2: Bare UPPERCASE words (2-5 chars) - only if they pass the filter
     # We require word boundaries and skip common conversational false-positives
-    bare = re.findall(r"\b([A-Z]{2,5})\b", text)
+    bare = re.findall(r"\b([A-Z]{2,5})\b", cleaned)
     for word in bare:
         if word in COMMON_FALSE_POSITIVES:
             continue
@@ -667,7 +730,7 @@ def build_dashboard_payload() -> dict:
     """Fetch everything and shape it for the dashboard."""
     started = time.time()
     tickers_by_sub = fetch_apewisdom_tickers()
-    posts_by_sub = fetch_all_arctic_posts()
+    posts_by_sub, post_errors = fetch_all_arctic_posts_parallel()
 
     # Gather all unique tickers we need prices for (top 30 per sub, deduped)
     all_tickers: set[str] = set()
@@ -686,7 +749,7 @@ def build_dashboard_payload() -> dict:
     # Build the per-ticker post index from all fetched posts + comments
     all_posts_flat = [p for sub_posts in posts_by_sub.values() for p in sub_posts]
     # Comments: fetch from a separate config of subs (smaller set for performance)
-    comments_by_sub = fetch_all_arctic_comments()
+    comments_by_sub, comment_errors = fetch_all_arctic_comments_parallel()
     all_comments_flat = [c for sub_comments in comments_by_sub.values() for c in sub_comments]
     full_ticker_index = build_ticker_post_index(all_posts_flat, all_comments_flat)
 
@@ -806,6 +869,12 @@ def build_dashboard_payload() -> dict:
         }
         for sub in set(list(tickers_by_sub.keys()) + list(posts_by_sub.keys()))
     ]
+    # Merge any fetch errors into freshness so the UI can show them
+    for sub, err in {**post_errors, **comment_errors}.items():
+        for f in freshness:
+            if f["subreddit"] == sub:
+                f["error"] = err
+                break
 
     return {
         "last_scrape": datetime.now(timezone.utc).isoformat(),
@@ -819,6 +888,13 @@ def build_dashboard_payload() -> dict:
         "prices": prices,
         "ticker_posts": ticker_posts_payload,
         "macro": macro,
+        "data_sources": {
+            "apewisdom_subs": len(tickers_by_sub),
+            "arctic_post_subs": len(posts_by_sub),
+            "arctic_comment_subs": len(comments_by_sub),
+            "yahoo_prices": len(prices),
+            "macro_indicators": len(macro),
+        },
     }
 
 
@@ -826,8 +902,8 @@ def build_ticker_detail(ticker: str) -> dict:
     """Build a per-ticker detail payload by searching current snapshots."""
     upper = ticker.upper().lstrip("$")
     tickers_by_sub = fetch_apewisdom_tickers()
-    posts_by_sub = fetch_all_arctic_posts()
-    comments_by_sub = fetch_all_arctic_comments()
+    posts_by_sub, _ = fetch_all_arctic_posts_parallel()
+    comments_by_sub, _ = fetch_all_arctic_comments_parallel()
 
     # Per-sub stats
     latest = []
@@ -1210,6 +1286,13 @@ TEMPLATE = r"""
   .skeleton-card .skeleton.s2 { width: 70%; height: 10px; }
   .skeleton-card .skeleton.s3 { width: 90%; height: 10px; }
   .skeleton-card .skeleton.s4 { width: 50%; height: 28px; margin-top: 12px; }
+  .skel-step {
+    display: inline-block;
+    padding: 2px 6px;
+    background: var(--panel-2);
+    border-radius: 3px;
+    margin-right: 4px;
+  }
 
   /* ----- Error / stale banners ----- */
   .banner {
@@ -1532,9 +1615,26 @@ function hideBanner() {
 // ----- Skeletons -----
 
 function renderSkeletons() {
-  // Mimic the layout: macro strip (collapsed), watchlist, 3-4 per-sub groups
-  let html = `<div class="card"><div class="skeleton" style="width:60%;height:14px;"></div></div>`;
-  html += `<div class="card"><div class="skeleton" style="width:40%;"></div><div class="ticker-grid" style="margin-top:12px;">`;
+  // Mimic the layout with a clear progress message for the long cold-cache
+  // fetch (~25-40s on first load or after TTL expiry). The 3 ⏳ indicators
+  // show the user that 3 different free APIs are being hit in parallel.
+  let html = `<div class="card">
+    <div class="skeleton" style="width:60%;height:14px;"></div>
+    <div class="skeleton" style="width:40%;"></div>
+  </div>`;
+  html += `<div class="card">
+    <div style="margin-bottom:12px;">
+      <strong style="color:var(--text);font-size:14px;">Fetching from 3 free APIs...</strong>
+      <div style="font-size:11px;margin-top:6px;color:var(--muted);">
+        <span class="skel-step">⏳ ApeWisdom</span> ·
+        <span class="skel-step">⏳ Arctic Shift (14 subs, comments)</span> ·
+        <span class="skel-step">⏳ Yahoo Finance (100+ tickers)</span>
+      </div>
+      <div style="font-size:11px;margin-top:8px;color:var(--muted);">
+        Cold cache: ~30 seconds. After that, instant for 1 hour.
+      </div>
+    </div>
+    <div class="ticker-grid">`;
   for (let i = 0; i < 8; i++) {
     html += `<div class="skeleton-card">
       <div class="skeleton s1"></div>
