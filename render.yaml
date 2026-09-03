@@ -10,12 +10,20 @@ services:
       - key: PYTHON_VERSION
         value: 3.11.9
       - key: SUBS
-        value: "wallstreetbets,stocks,investing,options,StockMarket,pennystocks,SPACs"
+        value: "wallstreetbets,wallstreetbetsnew,stocks,investing,options,StockMarket,pennystocks,SPACs,Superstonk,SNDK,MSTR,amcstock,nvidia,BBBY"
       - key: POST_SUBS
-        value: "stocks,investing,options,StockMarket,pennystocks,SPACs"
+        value: "wallstreetbetsnew,stocks,investing,options,StockMarket,pennystocks,SPACs,Superstonk,SNDK,MSTR,amcstock,nvidia,BBBY"
+      - key: COMMENT_SUBS
+        value: "wallstreetbets,wallstreetbetsnew,stocks,investing,options,StockMarket,Superstonk,nvidia"
       - key: CACHE_TTL
         value: "3600"
+      - key: PRICE_CACHE_TTL
+        value: "300"
+      - key: MACRO_CACHE_TTL
+        value: "900"
       - key: POSTS_PER_SUB
-        value: "30"
+        value: "300"
       - key: POST_LOOKBACK_DAYS
         value: "7"
+      - key: POST_BODY_EXTRACT_CHARS
+        value: "5000"

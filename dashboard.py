@@ -873,6 +873,39 @@ price_caches: dict[str, Cache] = {
 macro_cache = Cache(ttl=MACRO_CACHE_TTL)
 
 
+class KeyedCache:
+    """Per-key TTL cache for things like /api/ticker/<T> where each
+    ticker has its own entry. Prevents re-fetching the same ticker twice."""
+
+    def __init__(self, ttl: int):
+        self.ttl = ttl
+        self._data: dict[str, tuple[float, Any]] = {}
+        self._lock = threading.Lock()
+
+    def get(self, key: str) -> Any | None:
+        with self._lock:
+            entry = self._data.get(key)
+            if entry is None:
+                return None
+            ts, value = entry
+            if time.time() - ts >= self.ttl:
+                del self._data[key]
+                return None
+            return value
+
+    def set(self, key: str, value: Any) -> None:
+        with self._lock:
+            self._data[key] = (time.time(), value)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._data.clear()
+
+
+# Per-ticker cache: 5 min TTL. Each ticker has its own entry.
+ticker_cache = KeyedCache(ttl=300)
+
+
 @app.route("/api/stats")
 def api_stats():
     """Main dashboard payload. Cached for CACHE_TTL seconds."""
@@ -913,9 +946,18 @@ def api_prices():
 
 @app.route("/api/ticker/<ticker>")
 def api_ticker_detail(ticker: str):
-    """Ticker detail. Not cached (per-ticker lookups are cheap)."""
+    """Ticker detail. Cached for 5 min to avoid 30s+ cold fetches on every click."""
+    upper = ticker.upper().lstrip("$")[:10]
+    # Use a small per-ticker cache (5 min TTL) - the fetch is expensive
+    # and ticker data is mostly static for ~5 min intervals
+    cache_key = f"ticker:{upper}"
+    cached = ticker_cache.get(cache_key)
+    if cached is not None:
+        return jsonify(cached)
     try:
-        return jsonify(build_ticker_detail(ticker))
+        data = build_ticker_detail(ticker)
+        ticker_cache.set(cache_key, data)
+        return jsonify(data)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
