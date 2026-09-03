@@ -40,7 +40,11 @@ POST_BODY_EXTRACT_CHARS = int(os.getenv("POST_BODY_EXTRACT_CHARS", "5000"))  # w
 
 # Subreddits we track. ApeWisdom covers all of these with rankings.
 # Arctic Shift has good coverage for all except r/wallstreetbets (sparse).
+# Note: we only include subs that are actively posted to (verified via API
+# freshness check). Dead subs like r/StockMarketDiscussion (last post 217d ago)
+# were removed.
 DEFAULT_SUBS = [
+    # Mega-high-volume
     "wallstreetbets",
     "wallstreetbetsnew",
     "stocks",
@@ -50,11 +54,23 @@ DEFAULT_SUBS = [
     "pennystocks",
     "SPACs",
     "Superstonk",
+    # Niche / company-specific
     "SNDK",
     "MSTR",
     "amcstock",
     "nvidia",
     "BBBY",
+    # General stock discussion - added for coverage
+    "smallstreetbets",
+    "StocksAndTrading",
+    "investing_discussion",
+    "ValueInvesting",
+    "Daytrading",
+    "SwingTrading",
+    "ETFs",
+    "RobinHood",
+    "Bogleheads",
+    "personalfinance",
 ]
 
 SUBS = [
@@ -1846,11 +1862,12 @@ function renderTickerCard(t, opts = {}) {
     `;
   } else {
     // Reserve the same vertical space so cards align in the grid
+    // Explain WHY this happens - it's a real signal, not a bug
     whyHtml = `
       <div class="why-trending empty" onclick="event.stopPropagation()">
         <div class="why-label no-data">Why it's trending</div>
-        <div style="font-size: 10px; color: var(--muted); font-style: italic; opacity: 0.6;">
-          no post match
+        <div style="font-size: 10px; color: var(--muted); font-style: italic; line-height: 1.4;">
+          being mentioned across subs but no dedicated posts this week
         </div>
       </div>
     `;

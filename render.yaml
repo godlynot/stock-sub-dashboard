@@ -10,11 +10,11 @@ services:
       - key: PYTHON_VERSION
         value: 3.11.9
       - key: SUBS
-        value: "wallstreetbets,wallstreetbetsnew,stocks,investing,options,StockMarket,pennystocks,SPACs,Superstonk,SNDK,MSTR,amcstock,nvidia,BBBY"
+        value: "wallstreetbets,wallstreetbetsnew,stocks,investing,options,StockMarket,pennystocks,SPACs,Superstonk,SNDK,MSTR,amcstock,nvidia,BBBY,smallstreetbets,StocksAndTrading,investing_discussion,ValueInvesting,Daytrading,SwingTrading,ETFs,RobinHood,Bogleheads,personalfinance"
       - key: POST_SUBS
-        value: "wallstreetbetsnew,stocks,investing,options,StockMarket,pennystocks,SPACs,Superstonk,SNDK,MSTR,amcstock,nvidia,BBBY"
+        value: "wallstreetbetsnew,stocks,investing,options,StockMarket,pennystocks,SPACs,Superstonk,SNDK,MSTR,amcstock,nvidia,BBBY,smallstreetbets,StocksAndTrading,investing_discussion,ValueInvesting,Daytrading,SwingTrading,ETFs,RobinHood,Bogleheads,personalfinance"
       - key: COMMENT_SUBS
-        value: "wallstreetbets,wallstreetbetsnew,stocks,investing,options,StockMarket,Superstonk,nvidia"
+        value: "wallstreetbets,wallstreetbetsnew,stocks,investing,options,StockMarket,Superstonk,nvidia,smallstreetbets,StocksAndTrading,ValueInvesting"
       - key: CACHE_TTL
         value: "3600"
       - key: PRICE_CACHE_TTL
