@@ -16,6 +16,11 @@ Run:
 import os
 import threading
 import time
+import urllib.request
+import urllib.parse
+import json
+import re
+import sys
 from datetime import datetime, timezone
 from typing import Any
 
@@ -29,6 +34,7 @@ from flask import Flask, jsonify, render_template_string, request
 CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))  # 1 hour for ticker data
 PRICE_CACHE_TTL = int(os.getenv("PRICE_CACHE_TTL", "300"))  # 5 min for prices
 MACRO_CACHE_TTL = int(os.getenv("MACRO_CACHE_TTL", "900"))  # 15 min for macro
+EARNINGS_CACHE_TTL = int(os.getenv("EARNINGS_CACHE_TTL", "21600"))  # 6 hours (rarely changes)
 APEWISDOM_TIMEOUT = int(os.getenv("APEWISDOM_TIMEOUT", "20"))
 ARCTIC_TIMEOUT = int(os.getenv("ARCTIC_TIMEOUT", "30"))
 YAHOO_TIMEOUT = int(os.getenv("YAHOO_TIMEOUT", "10"))
@@ -383,6 +389,80 @@ def fetch_all_arctic_comments_parallel() -> tuple[dict[str, list[dict]], dict[st
             if err:
                 errors[sub] = err
     return out, errors
+
+
+def fetch_earnings_calendar(tracked_tickers: set[str] | None = None,
+                              days_ahead: int = 14) -> dict[str, list[dict]]:
+    """
+    Fetch the upcoming earnings calendar from Nasdaq and filter to tracked tickers.
+    Returns {ticker: [earnings_event, ...]} where each event is the most recent
+    upcoming one. Only future events (not past ones) are returned.
+
+    Nasdaq returns ~30-50 events per business day. With 14 days of look-ahead
+    we get ~300-500 events total; filtered to ~50-100 of our tracked tickers.
+    """
+    from datetime import datetime, timedelta
+    import concurrent.futures
+    out: dict[str, list[dict]] = {}
+    if tracked_tickers is None:
+        tracked_tickers = set()
+
+    today = datetime.now()
+    # Build list of business-day-ish dates to query (skip weekends to avoid empty
+    # responses; Nasdaq returns null for weekends)
+    dates = []
+    for offset in range(0, days_ahead + 1):
+        d = today + timedelta(days=offset)
+        if d.weekday() < 5:  # Mon-Fri
+            dates.append(d.strftime("%Y-%m-%d"))
+
+    def _fetch_one(date_str: str) -> tuple[str, list[dict]]:
+        url = f"https://api.nasdaq.com/api/calendar/earnings?date={date_str}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=8) as r:
+                d = json.loads(r.read())
+        except Exception:
+            return date_str, []
+        data = d.get("data") or {}
+        return date_str, data.get("rows", []) or []
+
+    # Parallel fetch - 14 dates, ~5s total instead of ~20s sequential
+    with concurrent.futures.ThreadPoolExecutor(max_workers=7) as ex:
+        results = list(ex.map(_fetch_one, dates))
+
+    # Group by symbol, keep only future events for tracked tickers
+    for date_str, rows in results:
+        for r in rows:
+            sym = r.get("symbol", "").upper()
+            if not sym or sym not in tracked_tickers:
+                continue
+            # Normalize the event
+            event = {
+                "date": date_str,
+                "symbol": sym,
+                "name": r.get("name", ""),
+                "time": r.get("time", ""),  # before-market, after-hours, time-not-supplied
+                "fiscal_quarter": r.get("fiscalQuarterEnding", ""),
+                "eps_forecast": r.get("epsForecast", ""),
+                "no_of_ests": r.get("noOfEsts", ""),
+                "last_year_date": r.get("lastYearRptDt", ""),
+                "last_year_eps": r.get("lastYearEPS", ""),
+                "market_cap": r.get("marketCap", ""),
+            }
+            # Convert time field to a friendly label
+            t = event["time"]
+            if t == "time-before-market" or t == "pre-market":
+                event["when"] = "Before market"
+            elif t == "time-after-hours" or t == "after-hours":
+                event["when"] = "After hours"
+            else:
+                event["when"] = "Time TBD"
+            out.setdefault(sym, []).append(event)
+    # Sort each ticker's events by date
+    for sym in out:
+        out[sym].sort(key=lambda e: e["date"])
+    return out
 
 
 # ----------------------------------------------------------------------------
@@ -849,6 +929,20 @@ def build_dashboard_payload() -> dict:
     trending_list.sort(key=lambda v: v["delta"], reverse=True)
     trending_list = trending_list[:15]
 
+    # Build the set of all tracked tickers (now we have per_sub_top, cross_sub_list, trending_list)
+    tracked_tickers: set[str] = set()
+    for tickers in per_sub_top.values():
+        for t in tickers:
+            tracked_tickers.add(t.get("ticker", ""))
+    for t in cross_sub_list:
+        tracked_tickers.add(t.get("ticker", ""))
+    for t in trending_list:
+        tracked_tickers.add(t.get("ticker", ""))
+    tracked_tickers.discard("")
+
+    # Fetch earnings calendar for tracked tickers (cached 6h)
+    earnings = earnings_cache.get(lambda: fetch_earnings_calendar(tracked_tickers, days_ahead=14))
+
     # Slim the per-ticker post index to just the tickers we actually display
     # (cross-sub leaderboard + trending) to keep the payload small
     important_tickers = set()
@@ -904,12 +998,15 @@ def build_dashboard_payload() -> dict:
         "prices": prices,
         "ticker_posts": ticker_posts_payload,
         "macro": macro,
+        "earnings": earnings,
         "data_sources": {
             "apewisdom_subs": len(tickers_by_sub),
             "arctic_post_subs": len(posts_by_sub),
             "arctic_comment_subs": len(comments_by_sub),
             "yahoo_prices": len(prices),
             "macro_indicators": len(macro),
+            "tracked_tickers": len(tracked_tickers),
+            "earnings_upcoming": len(earnings),
         },
     }
 
@@ -942,10 +1039,16 @@ def build_ticker_detail(ticker: str) -> dict:
     full_ticker_index = build_ticker_post_index(all_posts_flat, all_comments_flat)
     posts = full_ticker_index.get(upper, [])[:30]
 
+    # Get next earnings event for this ticker (if any)
+    tracked = {upper}
+    earnings_all = earnings_cache.get(lambda: fetch_earnings_calendar(tracked, days_ahead=14))
+    next_earnings = earnings_all.get(upper, [None])[0] if earnings_all.get(upper) else None
+
     return {
         "ticker": upper,
         "latest_per_sub": sorted(latest, key=lambda x: x.get("mentions", 0) or 0, reverse=True),
         "recent_posts": posts,
+        "next_earnings": next_earnings,
         "trend_7d": [],
     }
 
@@ -963,6 +1066,8 @@ price_caches: dict[str, Cache] = {
 }
 # Macro data is less volatile - cache for 15 min
 macro_cache = Cache(ttl=MACRO_CACHE_TTL)
+# Earnings calendar rarely changes - cache for 6 hours
+earnings_cache = Cache(ttl=EARNINGS_CACHE_TTL)
 
 
 class KeyedCache:
@@ -1032,6 +1137,34 @@ def api_prices():
             lambda: fetch_yahoo_prices(stock_tickers, timeframe)
         )
         return jsonify(prices)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/earnings")
+def api_earnings():
+    """Earnings calendar for the next 14 days. Filtered to tracked tickers."""
+    try:
+        # Build tracked tickers from cached data if possible
+        tracked: set[str] = set()
+        cached = cache._data
+        if cached:
+            for tickers in cached.get("per_sub_top", {}).values():
+                for t in tickers:
+                    tracked.add(t.get("ticker", ""))
+            for t in cached.get("cross_sub_leaderboard", []):
+                tracked.add(t.get("ticker", ""))
+            for t in cached.get("trending", []):
+                tracked.add(t.get("ticker", ""))
+        if not tracked:
+            # No cached data yet; fetch fresh
+            tickers_by_sub = fetch_apewisdom_tickers()
+            for tickers in tickers_by_sub.values():
+                for t in tickers[:30]:
+                    tracked.add(t.get("ticker", ""))
+        tracked.discard("")
+        earnings = earnings_cache.get(lambda: fetch_earnings_calendar(tracked, days_ahead=14))
+        return jsonify(earnings)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1159,7 +1292,14 @@ TEMPLATE = r"""
   .ticker-card .sym { font-weight: 700; color: var(--accent); font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 14px; }
   .ticker-card .name { font-size: 11px; color: var(--muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .ticker-card .price-row { display: flex; justify-content: space-between; align-items: baseline; margin-top: 6px; font-size: 12px; }
-  .ticker-card .price { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .ticker-card .price {
+    color: var(--text);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    transition: color 0.6s ease-out;
+  }
+  .ticker-card .price.flash-up { color: var(--green); }
+  .ticker-card .price.flash-down { color: var(--red); }
   .ticker-card .change { font-weight: 600; font-size: 11px; padding: 1px 5px; border-radius: 3px; font-variant-numeric: tabular-nums; }
   .ticker-card .change.up { color: var(--green); background: rgba(63, 185, 80, 0.12); }
   .ticker-card .change.down { color: var(--red); background: rgba(248, 81, 73, 0.12); }
@@ -1308,6 +1448,65 @@ TEMPLATE = r"""
     background: var(--panel-2);
     border-radius: 3px;
     margin-right: 4px;
+  }
+
+  /* ----- Earnings table ----- */
+  .earnings-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  .earnings-table th {
+    text-align: left;
+    color: var(--muted);
+    font-size: 10px;
+    text-transform: uppercase;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  .earnings-table td {
+    padding: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  .earnings-table tr:last-child td { border-bottom: none; }
+  .earnings-table tr:hover td { background: var(--panel-2); }
+
+  /* ----- Heatmap ----- */
+  .heatmap-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    align-items: center;
+    justify-content: flex-start;
+  }
+  .heatmap-cell {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    border-radius: 6px;
+    color: var(--text);
+    text-decoration: none;
+    transition: transform 0.15s, box-shadow 0.15s;
+    min-width: 70px;
+    border: 1px solid rgba(255,255,255,0.05);
+  }
+  .heatmap-cell:hover {
+    transform: scale(1.08);
+    box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+    z-index: 1;
+  }
+  .heatmap-cell .heatmap-sym {
+    font-size: 12px;
+    font-weight: 700;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  .heatmap-cell .heatmap-chg {
+    font-size: 10px;
+    font-weight: 600;
+    margin-top: 2px;
   }
 
   /* ----- Error / stale banners ----- */
@@ -1985,6 +2184,108 @@ function renderMacroStrip(macro) {
   `;
 }
 
+function renderEarningsCard(earnings) {
+  // Show upcoming earnings for tracked tickers, sorted by date
+  // earnings is {ticker: [event, ...]} dict
+  const all = [];
+  for (const ticker in (earnings || {})) {
+    for (const ev of earnings[ticker]) {
+      all.push({ticker, ...ev});
+    }
+  }
+  all.sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+  if (all.length === 0) {
+    return `<div class="card">
+      <h2>📅 Upcoming Earnings</h2>
+      <div class="empty" style="padding:14px 0;">No earnings for tracked tickers in the next 14 days.</div>
+    </div>`;
+  }
+  // Take the first 8
+  const top = all.slice(0, 8);
+  return `<div class="card grid-full">
+    <h2>📅 Upcoming Earnings (next 14 days)</h2>
+    <div style="overflow-x:auto;">
+      <table class="earnings-table">
+        <thead>
+          <tr>
+            <th>Date</th>
+            <th>Ticker</th>
+            <th>Company</th>
+            <th>When</th>
+            <th>EPS Est.</th>
+            <th># Est.</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${top.map(ev => {
+            const d = new Date(ev.date + 'T00:00:00');
+            const dayName = d.toLocaleDateString('en-US', { weekday: 'short' });
+            const dateStr = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+            const isToday = ev.date === new Date().toISOString().slice(0, 10);
+            return `<tr>
+              <td><strong>${dateStr}</strong> <span style="color:var(--muted);font-size:11px;">${dayName}${isToday ? ' (TODAY)' : ''}</span></td>
+              <td><a href="/ticker/${ev.ticker}" style="color:var(--accent);text-decoration:none;font-weight:600;">$${escapeHtml(ev.ticker)}</a></td>
+              <td style="color:var(--muted);">${escapeHtml((ev.name || '').slice(0, 28))}</td>
+              <td style="color:var(--muted);font-size:12px;">${escapeHtml(ev.when || 'Time TBD')}</td>
+              <td style="font-variant-numeric:tabular-nums;">${escapeHtml(ev.eps_forecast || '—')}</td>
+              <td style="color:var(--muted);">${escapeHtml(ev.no_of_ests || '—')}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+    </div>
+    ${all.length > 8 ? `<div style="text-align:center;color:var(--muted);font-size:12px;margin-top:8px;">+${all.length - 8} more</div>` : ''}
+  </div>`;
+}
+
+function renderHeatmap(prices, perSubTop) {
+  // Heatmap of all tracked tickers colored by % change.
+  // Size = mentions (bigger = more talked about).
+  // Color = % change (red=down, green=up, intensity = magnitude).
+  if (!prices || Object.keys(prices).length === 0) return '';
+  // Collect all tickers with their mention counts
+  const mentionCounts = {};
+  for (const sub in (perSubTop || {})) {
+    for (const t of (perSubTop[sub] || [])) {
+      mentionCounts[t.ticker] = (mentionCounts[t.ticker] || 0) + (t.mentions || 0);
+    }
+  }
+  // Filter to tickers we have prices for
+  const items = Object.keys(prices)
+    .filter(t => prices[t] && prices[t].price)
+    .map(t => ({
+      ticker: t,
+      price: prices[t].price,
+      change: prices[t].change_pct,
+      mentions: mentionCounts[t] || 0,
+    }))
+    .sort((a, b) => b.mentions - a.mentions)
+    .slice(0, 50);  // top 50 by mentions
+
+  if (items.length === 0) return '';
+  // Find min/max for sizing
+  const maxMentions = Math.max(1, ...items.map(i => i.mentions));
+
+  return `<div class="card grid-full">
+    <h2>🔥 Market Heatmap</h2>
+    <div class="heatmap-grid">
+      ${items.map(i => {
+        const intensity = Math.min(1, Math.abs(i.change || 0) / 5);  // cap at 5%
+        const opacity = 0.3 + intensity * 0.7;
+        const bg = (i.change || 0) >= 0
+          ? `rgba(63, 185, 80, ${opacity})`     // green for up
+          : `rgba(248, 81, 73, ${opacity})`;     // red for down
+        const size = 70 + (i.mentions / maxMentions) * 40;  // 70-110px
+        const changeStr = (i.change >= 0 ? '+' : '') + (i.change || 0).toFixed(2) + '%';
+        return `<a href="/ticker/${i.ticker}" class="heatmap-cell" style="background:${bg};width:${size}px;height:${size}px;">
+          <div class="heatmap-sym">$${escapeHtml(i.ticker)}</div>
+          <div class="heatmap-chg">${changeStr}</div>
+        </a>`;
+      }).join('')}
+    </div>
+  </div>`;
+}
+
 function renderWatchlistSection() {
   const watchlist = getWatchlist();
   if (watchlist.length === 0) {
@@ -2080,6 +2381,8 @@ function render(d) {
 
   const html = `
     ${renderMacroStrip(d.macro)}
+    ${renderHeatmap(d.prices, d.per_sub_top)}
+    ${renderEarningsCard(d.earnings)}
     ${renderWatchlistSection()}
 
     <div class="card">
@@ -2176,6 +2479,28 @@ function render(d) {
   document.getElementById('dashboard').innerHTML = html;
   // Re-apply any active search filter to the newly-rendered cards
   applyFilter();
+  // Flash price colors when they change (up=green, down=red) for 0.6s
+  flashPriceChanges();
+}
+
+const _lastPrices = {};
+function flashPriceChanges() {
+  // For each ticker card, compare new price to last seen price, flash color
+  const cards = document.querySelectorAll('.ticker-card[data-ticker]');
+  cards.forEach(card => {
+    const ticker = card.getAttribute('data-ticker');
+    const priceEl = card.querySelector('.price');
+    if (!priceEl) return;
+    const text = priceEl.textContent.replace(/[$,]/g, '');
+    const newPrice = parseFloat(text);
+    if (isNaN(newPrice)) return;
+    if (_lastPrices[ticker] !== undefined && _lastPrices[ticker] !== newPrice) {
+      const dir = newPrice > _lastPrices[ticker] ? 'flash-up' : 'flash-down';
+      priceEl.classList.add(dir);
+      setTimeout(() => priceEl.classList.remove(dir), 800);
+    }
+    _lastPrices[ticker] = newPrice;
+  });
 }
 
 function escapeHtml(s) {
