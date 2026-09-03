@@ -984,10 +984,11 @@ TEMPLATE = r"""
     background: rgba(255,255,255,0.2);
     color: white;
     border: 1px solid rgba(255,255,255,0.3);
-    padding: 4px 10px;
+    padding: 6px 12px;
     border-radius: 4px;
     font-size: 12px;
     cursor: pointer;
+    min-height: 36px;  /* touch target */
   }
   .refresh-btn:hover { background: rgba(255,255,255,0.3); }
   main { padding: 16px 20px 60px; max-width: 1100px; margin: 0 auto; }
@@ -1140,6 +1141,128 @@ TEMPLATE = r"""
     font-size: 13px;
   }
   .back-link:hover { text-decoration: underline; }
+
+  /* ----- Skeleton loaders ----- */
+  @keyframes shimmer {
+    0% { background-position: -200px 0; }
+    100% { background-position: calc(200px + 100%) 0; }
+  }
+  .skeleton {
+    background: linear-gradient(90deg, var(--panel-2) 0%, var(--border) 50%, var(--panel-2) 100%);
+    background-size: 200px 100%;
+    animation: shimmer 1.5s infinite linear;
+    border-radius: 4px;
+    height: 12px;
+    margin: 8px 0;
+  }
+  .skeleton-line { display: block; }
+  .skeleton-card {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    min-height: 110px;
+  }
+  .skeleton-card .skeleton { margin: 6px 0; }
+  .skeleton-card .skeleton.s1 { width: 40%; height: 14px; }
+  .skeleton-card .skeleton.s2 { width: 70%; height: 10px; }
+  .skeleton-card .skeleton.s3 { width: 90%; height: 10px; }
+  .skeleton-card .skeleton.s4 { width: 50%; height: 28px; margin-top: 12px; }
+
+  /* ----- Error / stale banners ----- */
+  .banner {
+    position: fixed;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 2000;
+    max-width: 90vw;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-left: 4px solid var(--accent);
+    border-radius: 6px;
+    padding: 10px 16px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+    font-size: 13px;
+    animation: slideDown 0.3s ease-out;
+  }
+  @keyframes slideDown {
+    from { transform: translate(-50%, -100%); opacity: 0; }
+    to { transform: translate(-50%, 0); opacity: 1; }
+  }
+  .banner.error { border-left-color: var(--red); background: rgba(248, 81, 73, 0.08); }
+  .banner.warn { border-left-color: var(--gold); background: rgba(210, 153, 34, 0.08); }
+  .banner .banner-msg { flex: 1; }
+  .banner .banner-close {
+    background: transparent;
+    border: none;
+    color: var(--muted);
+    font-size: 18px;
+    cursor: pointer;
+    padding: 0 4px;
+    line-height: 1;
+    min-width: 32px;
+    min-height: 32px;
+  }
+  .banner .banner-close:hover { color: var(--text); }
+  .stale-badge {
+    display: inline-block;
+    background: rgba(210, 153, 34, 0.2);
+    color: var(--gold);
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    padding: 2px 6px;
+    border-radius: 3px;
+    margin-left: 6px;
+    letter-spacing: 0.3px;
+  }
+  .footer-meta {
+    text-align: center;
+    color: var(--muted);
+    font-size: 11px;
+    padding: 4px 14px 16px;
+  }
+
+  /* ----- Auto-refresh toggle ----- */
+  .auto-refresh-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--muted);
+    cursor: pointer;
+    user-select: none;
+    padding: 4px 8px;
+    border-radius: 4px;
+  }
+  .auto-refresh-toggle:hover { color: var(--text); background: var(--panel-2); }
+  .auto-refresh-toggle input { display: none; }
+  .auto-refresh-toggle .switch {
+    width: 28px;
+    height: 16px;
+    background: var(--border);
+    border-radius: 10px;
+    position: relative;
+    transition: background 0.2s;
+  }
+  .auto-refresh-toggle .switch::after {
+    content: '';
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 12px;
+    height: 12px;
+    background: var(--text);
+    border-radius: 50%;
+    transition: transform 0.2s;
+  }
+  .auto-refresh-toggle input:checked + .switch { background: var(--accent); }
+  .auto-refresh-toggle input:checked + .switch::after { transform: translateX(12px); }
+
   .loading { text-align: center; padding: 40px; color: var(--muted); }
   .stat-line { display: flex; justify-content: space-between; padding: 4px 0; font-size: 13px; }
   .stat-line .lbl { color: var(--muted); }
@@ -1192,6 +1315,8 @@ TEMPLATE = r"""
     cursor: pointer;
     font-family: inherit;
     font-weight: 500;
+    min-height: 32px;  /* touch target */
+    min-width: 44px;
   }
   .timeframe-selector button:hover { color: var(--text); }
   .timeframe-selector button.active {
@@ -1271,6 +1396,11 @@ TEMPLATE = r"""
   <div class="subtitle">
     <span id="last-scrape">Loading...</span>
     <button class="refresh-btn" onclick="loadData(true)">↻ Refresh</button>
+    <label class="auto-refresh-toggle" title="Auto-refresh every 5 min">
+      <input type="checkbox" id="auto-refresh-input" onchange="toggleAutoRefresh()">
+      <span class="switch"></span>
+      <span>auto</span>
+    </label>
   </div>
 </header>
 
@@ -1301,9 +1431,10 @@ TEMPLATE = r"""
   </div>
 </div>
 
-<div class="footer">
-  Data: ApeWisdom + Arctic Shift. Cached for 1 hour. Not financial advice.
+<div class="footer" id="footer-data">
+  Data: ApeWisdom + Arctic Shift + Yahoo Finance. Cached for 1 hour. Not financial advice.
 </div>
+<div class="footer-meta" id="footer-meta"></div>
 
 <script>
 let dashboardData = null;
@@ -1311,7 +1442,7 @@ let dashboardData = null;
 async function loadData(force = false) {
   const dash = document.getElementById('dashboard');
   if (force) {
-    dash.innerHTML = '<div class="loading">Refreshing (cold cache can take ~10-30s)...</div>';
+    dash.innerHTML = renderSkeletons();
   }
   try {
     const url = force ? '/api/refresh' : '/api/stats';
@@ -1319,15 +1450,83 @@ async function loadData(force = false) {
     const resp = await fetch(url, opts);
     dashboardData = await resp.json();
     if (dashboardData.error) {
-      dash.innerHTML = `<div class="card"><div class="empty">Error: ${escapeHtml(dashboardData.error)}</div></div>`;
+      showBanner(`Refresh failed: ${escapeHtml(dashboardData.error)}`, 'error');
       return;
     }
     render(dashboardData);
+    hideBanner();  // clear any prior error
   } catch (e) {
     console.error('loadData failed:', e);
-    dash.innerHTML = `<div class="card"><div class="empty">Error loading data: ${escapeHtml(e.message || String(e))}</div></div>`;
+    showBanner(`Couldn't reach server: ${escapeHtml(e.message || String(e))}. Showing cached data.`, 'error');
+    // Keep old data visible — don't replace the page
   }
 }
+
+// ----- Banner -----
+
+let _bannerTimer = null;
+function showBanner(msg, kind = 'error', autoHideMs = 6000) {
+  // Remove any existing banner
+  hideBanner();
+  const b = document.createElement('div');
+  b.className = `banner ${kind}`;
+  b.id = 'global-banner';
+  b.innerHTML = `
+    <span class="banner-msg">${msg}</span>
+    <button class="banner-close" onclick="hideBanner()">&times;</button>
+  `;
+  document.body.appendChild(b);
+  if (autoHideMs) {
+    _bannerTimer = setTimeout(() => hideBanner(), autoHideMs);
+  }
+}
+function hideBanner() {
+  if (_bannerTimer) clearTimeout(_bannerTimer);
+  _bannerTimer = null;
+  const existing = document.getElementById('global-banner');
+  if (existing) existing.remove();
+}
+
+// ----- Skeletons -----
+
+function renderSkeletons() {
+  // Mimic the layout: macro strip (collapsed), watchlist, 3-4 per-sub groups
+  let html = `<div class="card"><div class="skeleton" style="width:60%;height:14px;"></div></div>`;
+  html += `<div class="card"><div class="skeleton" style="width:40%;"></div><div class="ticker-grid" style="margin-top:12px;">`;
+  for (let i = 0; i < 8; i++) {
+    html += `<div class="skeleton-card">
+      <div class="skeleton s1"></div>
+      <div class="skeleton s2"></div>
+      <div class="skeleton s3"></div>
+      <div class="skeleton s4"></div>
+    </div>`;
+  }
+  html += `</div></div>`;
+  return html;
+}
+
+// ----- Auto-refresh -----
+
+let autoRefreshTimer = null;
+function toggleAutoRefresh() {
+  const checked = document.getElementById('auto-refresh-input').checked;
+  if (checked) {
+    autoRefreshTimer = setInterval(() => loadData(false), 5 * 60 * 1000);
+    localStorage.setItem('auto-refresh', '1');
+  } else {
+    if (autoRefreshTimer) clearInterval(autoRefreshTimer);
+    autoRefreshTimer = null;
+    localStorage.setItem('auto-refresh', '0');
+  }
+}
+// Restore preference on load
+window.addEventListener('DOMContentLoaded', () => {
+  const saved = localStorage.getItem('auto-refresh');
+  if (saved === '1') {
+    document.getElementById('auto-refresh-input').checked = true;
+    toggleAutoRefresh();
+  }
+});
 
 function renderSparkline(prices) {
   if (!prices || !prices.sparkline || prices.sparkline.length < 2) return '';
@@ -1694,10 +1893,23 @@ function render(d) {
     else ageStr = ` (${Math.round(age/60)}h ago)`;
   }
   let headerText = `Updated: ${lastScrape}${ageStr}`;
+  let staleBadge = '';
+  if (age !== null && age > 30) {
+    // Data is more than 30 min old — show a "stale" indicator
+    staleBadge = '<span class="stale-badge" title="Data is more than 30 minutes old. Click Refresh to update.">stale</span>';
+  }
   if (d.force_refreshed) {
     headerText += '  (just refreshed)';
   }
-  document.getElementById('last-scrape').textContent = headerText;
+  document.getElementById('last-scrape').innerHTML = headerText + staleBadge;
+
+  // Footer meta
+  const fm = document.getElementById('footer-meta');
+  if (fm && d.last_scrape) {
+    const fetchSecs = d.fetch_time_seconds || 0;
+    const ageMin = age !== null ? Math.round(age) : '?';
+    fm.innerHTML = `Data fetched in ${fetchSecs}s · Cached, ${ageMin}m old · <a href="/api/stats" style="color:var(--muted)">API</a> · <a href="https://github.com/godlynot/stock-sub-dashboard" style="color:var(--muted)" target="_blank">GitHub</a>`;
+  }
 
   // Notice for first cold load
   const noticeArea = document.getElementById('notice-area');
