@@ -17,7 +17,6 @@ import os
 import threading
 import time
 import urllib.request
-import urllib.parse
 import json
 import re
 import sys
@@ -589,8 +588,6 @@ def fetch_macro_indicators() -> dict[str, dict]:
 # ----------------------------------------------------------------------------
 # Ticker extraction (server-side, for the "why is it popular" index)
 # ----------------------------------------------------------------------------
-
-import re
 
 # Common WSB / stock-sub false-positives to filter out of bare-ticker matches.
 # Expanded significantly to handle conversational text and comments.
@@ -3209,7 +3206,10 @@ loadTicker();
 @app.route("/ticker/<ticker>")
 def ticker_page(ticker: str):
     """Dedicated page for a single ticker. Shareable, mobile-friendly."""
-    safe = ticker.upper().lstrip("$")[:10]  # sanitize
+    # Sanitize: uppercase, strip $ prefix, cap at 10 chars, then HTML-escape
+    # so the ticker can never break out of HTML or JS contexts
+    from html import escape as html_escape
+    safe = html_escape(ticker.upper().lstrip("$")[:10], quote=True)
     return render_template_string(
         TICKER_PAGE_TEMPLATE.replace("__TICKER__", safe)
     )
