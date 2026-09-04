@@ -1495,6 +1495,147 @@ TEMPLATE = r"""
   .earnings-table .buzz-positive { color: var(--green); font-weight: 600; }
   .earnings-table .buzz-negative { color: var(--red); font-weight: 600; }
   .earnings-table .buzz-flat { color: var(--muted); }
+  /* ----- Collapsible sections ----- */
+  .card.collapsible .card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    cursor: pointer;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .card.collapsible .card-header h2 {
+    margin: 0;
+    flex: 1;
+  }
+  .card.collapsible .collapse-toggle {
+    color: var(--muted);
+    font-size: 12px;
+    transition: transform 0.2s ease;
+  }
+  .card.collapsed .collapse-toggle {
+    transform: rotate(-90deg);
+  }
+  .card.collapsed .card-body {
+    display: none;
+  }
+  .card-body {
+    margin-top: 8px;
+  }
+
+  /* ----- Compact mode ----- */
+  body.compact .card { padding: 12px; margin-bottom: 12px; }
+  body.compact h2 { font-size: 14px; }
+  body.compact .ticker-card { padding: 8px; }
+  body.compact .ticker-card .sym { font-size: 13px; }
+  body.compact .ticker-card .name { font-size: 10px; }
+  body.compact .ticker-grid { gap: 6px; }
+  body.compact .earnings-table { font-size: 12px; }
+  body.compact .earnings-table td { padding: 5px 6px; }
+  body.compact .why-trending { min-height: 40px; }
+  body.compact .macro-strip { padding: 6px 8px; gap: 0; }
+  body.compact .macro-cell { padding: 4px 6px; }
+
+  /* ----- Section nav ----- */
+  .section-nav {
+    position: sticky;
+    top: 0;
+    z-index: 50;
+    background: rgba(13, 17, 23, 0.92);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--border);
+    padding: 8px 0;
+    margin: 0 -8px 12px -8px;
+    padding-left: 8px;
+    padding-right: 8px;
+    overflow-x: auto;
+    white-space: nowrap;
+    display: flex;
+    gap: 6px;
+  }
+  .section-nav button {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    padding: 5px 10px;
+    border-radius: 4px;
+    font-size: 11px;
+    cursor: pointer;
+    flex-shrink: 0;
+    font-family: inherit;
+  }
+  .section-nav button.active {
+    background: var(--accent);
+    color: white;
+    border-color: var(--accent);
+  }
+  .section-nav button:hover {
+    color: var(--text);
+    border-color: var(--muted);
+  }
+
+  /* ----- Today's moves summary bar ----- */
+  .todays-moves {
+    background: linear-gradient(135deg, var(--panel) 0%, var(--panel-2) 100%);
+    border: 1px solid var(--accent);
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px 12px;
+    font-size: 12px;
+  }
+  .todays-moves .move {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 6px;
+    border-radius: 3px;
+    background: var(--panel-2);
+  }
+  .todays-moves .move.up { color: var(--green); }
+  .todays-moves .move.down { color: var(--red); }
+  .todays-moves .move.label {
+    background: transparent;
+    color: var(--muted);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .todays-moves .ticker-link {
+    color: var(--accent);
+    text-decoration: none;
+    font-weight: 700;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  .todays-moves .sep {
+    color: var(--border);
+  }
+
+  /* ----- Mode toggle (compact) ----- */
+  .mode-toggle {
+    position: fixed;
+    bottom: 16px;
+    right: 16px;
+    width: 44px;
+    height: 44px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: white;
+    border: none;
+    font-size: 18px;
+    cursor: pointer;
+    box-shadow: 0 4px 16px rgba(88, 166, 255, 0.4);
+    z-index: 100;
+    font-family: inherit;
+  }
+  .mode-toggle:hover {
+    transform: scale(1.05);
+  }
+
   .earnings-hot {
     display: inline-block;
     margin-left: 4px;
@@ -1785,6 +1926,9 @@ TEMPLATE = r"""
     </label>
   </div>
 </header>
+
+<button id="compact-btn" class="mode-toggle" onclick="toggleCompact()" title="Toggle compact mode">⊟</button>
+<script>applyCompactMode();</script>
 
 <main>
   <div id="notice-area"></div>
@@ -2200,6 +2344,129 @@ function formatMacroValue(key, value) {
   return String(value);
 }
 
+function toggleCollapse(header) {
+  const card = header.closest('.card.collapsible');
+  if (!card) return;
+  card.classList.toggle('collapsed');
+  // Persist
+  const id = card.id;
+  if (id) {
+    const state = JSON.parse(localStorage.getItem('collapsed-sections') || '{}');
+    state[id] = card.classList.contains('collapsed');
+    localStorage.setItem('collapsed-sections', JSON.stringify(state));
+  }
+}
+
+function applyCollapsedState() {
+  const state = JSON.parse(localStorage.getItem('collapsed-sections') || '{}');
+  for (const id in state) {
+    const el = document.getElementById(id);
+    if (el && el.classList.contains('collapsible')) {
+      if (state[id]) el.classList.add('collapsed');
+      else el.classList.remove('collapsed');
+    }
+  }
+}
+
+function toggleCompact() {
+  const isCompact = document.body.classList.toggle('compact');
+  localStorage.setItem('compact-mode', isCompact ? '1' : '0');
+  const btn = document.getElementById('compact-btn');
+  if (btn) btn.textContent = isCompact ? '⊞' : '⊟';
+}
+
+function applyCompactMode() {
+  const isCompact = localStorage.getItem('compact-mode') === '1';
+  if (isCompact) document.body.classList.add('compact');
+  const btn = document.getElementById('compact-btn');
+  if (btn) btn.textContent = isCompact ? '⊞' : '⊟';
+}
+
+function animateCountUp(selector, duration = 800) {
+  // For elements matching the selector, animate from 0 to current value
+  document.querySelectorAll(selector).forEach(el => {
+    if (el.dataset.counted) return;
+    const text = el.textContent.trim();
+    const m = text.match(/^([+-]?)(\d+(?:\.\d+)?)$/);
+    if (!m) return;
+    const sign = m[1];
+    const target = parseFloat(m[2]);
+    if (isNaN(target)) return;
+    el.dataset.counted = '1';
+    const start = performance.now();
+    const tick = (now) => {
+      const t = Math.min(1, (now - start) / duration);
+      const eased = 1 - Math.pow(1 - t, 3);  // ease-out cubic
+      const v = target * eased;
+      el.textContent = sign + (Number.isInteger(target) ? v.toFixed(0) : v.toFixed(2));
+      if (t < 1) requestAnimationFrame(tick);
+      else el.textContent = sign + (Number.isInteger(target) ? target.toString() : target.toFixed(2));
+    };
+    requestAnimationFrame(tick);
+  });
+}
+
+function renderTodaysMoves(d) {
+  // One-line summary of the most important signals from this fetch
+  // 1. Top 3 movers (by |% change|) from cross_sub_leaderboard
+  // 2. Earnings today
+  // 3. Most-discussed ticker (highest total_mentions)
+  const items = [];
+  // Top movers
+  const movers = (d.cross_sub_leaderboard || [])
+    .filter(t => d.prices && d.prices[t.ticker])
+    .map(t => ({...t, change: d.prices[t.ticker].change_pct || 0}))
+    .sort((a, b) => Math.abs(b.change) - Math.abs(a.change))
+    .slice(0, 3);
+  if (movers.length > 0) {
+    items.push('<span class="move label">Top movers</span>');
+    for (const m of movers) {
+      const dir = m.change >= 0 ? 'up' : 'down';
+      const arrow = m.change >= 0 ? '🔺' : '🔻';
+      const sign = m.change >= 0 ? '+' : '';
+      items.push(`<a class="ticker-link" href="/ticker/${m.ticker}">$${escapeHtml(m.ticker)}</a> <span class="move ${dir}">${arrow} ${sign}${m.change.toFixed(1)}%</span>`);
+    }
+  }
+  // Earnings today
+  const today = new Date().toISOString().slice(0, 10);
+  const todaysEarnings = [];
+  for (const tk in (d.earnings || {})) {
+    for (const ev of d.earnings[tk]) {
+      if (ev.date === today) todaysEarnings.push({ticker: tk, ...ev});
+    }
+  }
+  if (todaysEarnings.length > 0) {
+    if (items.length) items.push('<span class="sep">|</span>');
+    items.push('<span class="move label">📅 Earnings today</span>');
+    for (const ev of todaysEarnings.slice(0, 4)) {
+      items.push(`<a class="ticker-link" href="/ticker/${ev.ticker}">$${escapeHtml(ev.ticker)}</a> <span class="move">${escapeHtml(ev.when || '')}</span>`);
+    }
+  }
+  // Most discussed
+  const top = (d.cross_sub_leaderboard || [])[0];
+  if (top) {
+    if (items.length) items.push('<span class="sep">|</span>');
+    items.push(`<span class="move label">🔥 Most discussed</span> <a class="ticker-link" href="/ticker/${top.ticker}">$${escapeHtml(top.ticker)}</a> <span class="move">${top.total_mentions} mentions</span>`);
+  }
+  if (items.length === 0) return '';
+  return `<div class="todays-moves">${items.join(' ')}</div>`;
+}
+
+function renderSectionNav() {
+  // Build a sticky nav with anchors to each major section
+  const sections = [
+    {id: 'sec-macro', label: '📊 Macro'},
+    {id: 'sec-heatmap', label: '🔥 Heatmap'},
+    {id: 'sec-earnings', label: '📅 Earnings'},
+    {id: 'sec-watchlist', label: '⭐ Watchlist'},
+    {id: 'sec-trending', label: '🔥 Trending'},
+    {id: 'sec-leaderboard', label: '🏆 Leaders'},
+  ];
+  return `<nav class="section-nav">${sections.map(s =>
+    `<button onclick="document.getElementById('${s.id}').scrollIntoView({behavior:'smooth',block:'start'})">${s.label}</button>`
+  ).join('')}</nav>`;
+}
+
 function renderMacroStrip(macro) {
   if (!macro) return '';
   // Order: rates first, then equities, then commodities, then derived
@@ -2236,8 +2503,8 @@ function renderMacroStrip(macro) {
 }
 
 function renderEarningsCard(earnings) {
-  // Show upcoming earnings, sorted by Reddit buzz (delta) so the most-talked-about
-  // earnings appear first. Within the same buzz level, sort by date.
+  // Returns just the table, not the wrapper card (the dashboard handles the
+  // collapsible card structure so the user can collapse this section)
   // earnings is {ticker: [event, ...]} dict; each event has reddit_mentions and
   // reddit_delta (set server-side in build_dashboard_payload).
   const all = [];
@@ -2247,10 +2514,7 @@ function renderEarningsCard(earnings) {
     }
   }
   if (all.length === 0) {
-    return `<div class="card">
-      <h2>📅 Upcoming Earnings</h2>
-      <div class="empty" style="padding:14px 0;">No earnings for tracked tickers in the next 14 days.</div>
-    </div>`;
+    return `<div class="empty" style="padding:14px 0;">No earnings for tracked tickers in the next 14 days.</div>`;
   }
   // Sort: by reddit delta desc (most discussed first), then by date
   all.sort((a, b) => {
@@ -2259,10 +2523,8 @@ function renderEarningsCard(earnings) {
     return (a.date || '').localeCompare(b.date || '');
   });
   const top = all.slice(0, 10);
-  return `<div class="card grid-full">
-    <h2>📅 Upcoming Earnings <span style="font-size:11px;font-weight:normal;color:var(--muted);text-transform:none;letter-spacing:0;">— sorted by Reddit buzz</span></h2>
-    <div style="overflow-x:auto;">
-      <table class="earnings-table">
+  return `<div style="overflow-x:auto;">
+    <table class="earnings-table">
         <thead>
           <tr>
             <th>Date</th>
@@ -2334,9 +2596,7 @@ function renderHeatmap(prices, perSubTop) {
   // Find min/max for sizing
   const maxMentions = Math.max(1, ...items.map(i => i.mentions));
 
-  return `<div class="card grid-full">
-    <h2>🔥 Market Heatmap</h2>
-    <div class="heatmap-grid">
+  return `<div class="heatmap-grid">
       ${items.map(i => {
         const intensity = Math.min(1, Math.abs(i.change || 0) / 5);  // cap at 5%
         const opacity = 0.3 + intensity * 0.7;
@@ -2351,7 +2611,7 @@ function renderHeatmap(prices, perSubTop) {
         </a>`;
       }).join('')}
     </div>
-  </div>`;
+  `;
 }
 
 function renderWatchlistSection() {
@@ -2448,10 +2708,38 @@ function render(d) {
   }
 
   const html = `
-    ${renderMacroStrip(d.macro)}
-    ${renderHeatmap(d.prices, d.per_sub_top)}
-    ${renderEarningsCard(d.earnings)}
-    ${renderWatchlistSection()}
+    ${renderTodaysMoves(d)}
+    ${renderSectionNav()}
+    <div id="sec-macro" class="card collapsible">
+      <div class="card-header" onclick="toggleCollapse(this)">
+        <h2>📊 Market Overview</h2>
+        <span class="collapse-toggle">▼</span>
+      </div>
+      <div class="card-body">
+        ${renderMacroStrip(d.macro)}
+      </div>
+    </div>
+    <div id="sec-heatmap" class="card collapsible">
+      <div class="card-header" onclick="toggleCollapse(this)">
+        <h2>🔥 Market Heatmap</h2>
+        <span class="collapse-toggle">▼</span>
+      </div>
+      <div class="card-body">
+        ${renderHeatmap(d.prices, d.per_sub_top)}
+      </div>
+    </div>
+    <div id="sec-earnings" class="card collapsible">
+      <div class="card-header" onclick="toggleCollapse(this)">
+        <h2>📅 Upcoming Earnings <span style="font-size:11px;font-weight:normal;color:var(--muted);text-transform:none;letter-spacing:0;">— sorted by Reddit buzz</span></h2>
+        <span class="collapse-toggle">▼</span>
+      </div>
+      <div class="card-body">
+        ${renderEarningsCard(d.earnings)}
+      </div>
+    </div>
+    <div id="sec-watchlist">
+      ${renderWatchlistSection()}
+    </div>
 
     <div class="card">
       <h2>🔥 Trending (mentions Δ vs 24h)</h2>
@@ -2547,8 +2835,12 @@ function render(d) {
   document.getElementById('dashboard').innerHTML = html;
   // Re-apply any active search filter to the newly-rendered cards
   applyFilter();
+  // Apply persisted collapse state (which sections are open/closed)
+  applyCollapsedState();
   // Flash price colors when they change (up=green, down=red) for 0.6s
   flashPriceChanges();
+  // Animate count-up of the macro indicator values (only on first load)
+  setTimeout(() => animateCountUp('.macro-cell .macro-val'), 100);
 }
 
 const _lastPrices = {};
