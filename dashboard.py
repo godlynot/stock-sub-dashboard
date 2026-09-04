@@ -943,6 +943,26 @@ def build_dashboard_payload() -> dict:
     # Fetch earnings calendar for tracked tickers (cached 6h)
     earnings = earnings_cache.get(lambda: fetch_earnings_calendar(tracked_tickers, days_ahead=14))
 
+    # Enrich earnings events with Reddit buzz data so the dashboard can highlight
+    # tickers that are both (a) reporting earnings soon AND (b) being talked about.
+    # This is the "adapt to Reddit" feature - earnings card now factors in social activity.
+    mention_by_ticker: dict[str, int] = {}
+    delta_by_ticker: dict[str, int] = {}
+    for sub, tickers in tickers_by_sub.items():
+        for t in tickers:
+            sym = t.get("ticker", "")
+            if not sym:
+                continue
+            mention_by_ticker[sym] = mention_by_ticker.get(sym, 0) + (t.get("mentions", 0) or 0)
+            m24 = t.get("mentions_24h_ago")
+            if m24 is not None:
+                delta_by_ticker[sym] = delta_by_ticker.get(sym, 0) + (t.get("mentions", 0) or 0) - (m24 or 0)
+    # Attach buzz to each event
+    for ticker, events in earnings.items():
+        for ev in events:
+            ev["reddit_mentions"] = mention_by_ticker.get(ticker, 0)
+            ev["reddit_delta"] = delta_by_ticker.get(ticker, 0)
+
     # Slim the per-ticker post index to just the tickers we actually display
     # (cross-sub leaderboard + trending) to keep the payload small
     important_tickers = set()
@@ -1472,6 +1492,28 @@ TEMPLATE = r"""
   }
   .earnings-table tr:last-child td { border-bottom: none; }
   .earnings-table tr:hover td { background: var(--panel-2); }
+  .earnings-table .buzz-positive { color: var(--green); font-weight: 600; }
+  .earnings-table .buzz-negative { color: var(--red); font-weight: 600; }
+  .earnings-table .buzz-flat { color: var(--muted); }
+  .earnings-hot {
+    display: inline-block;
+    margin-left: 4px;
+    font-size: 11px;
+    vertical-align: middle;
+  }
+  .earnings-badge {
+    display: inline-block;
+    margin-left: 6px;
+    background: rgba(210, 153, 34, 0.2);
+    color: var(--gold);
+    font-size: 9px;
+    font-weight: 600;
+    padding: 1px 5px;
+    border-radius: 3px;
+    vertical-align: middle;
+    text-transform: uppercase;
+    letter-spacing: 0.2px;
+  }
 
   /* ----- Heatmap ----- */
   .heatmap-grid {
@@ -2030,6 +2072,15 @@ function renderTickerCard(t, opts = {}) {
     ${renderSparkline(p)}
   ` : `<div class="no-price">price unavailable</div>`;
   const cardClick = `onclick="openTicker('${t.ticker}')"`;
+  // Upcoming earnings badge - show 📅 if this ticker has an upcoming earnings event
+  let earningsBadge = '';
+  const earningsEvents = (dashboardData && dashboardData.earnings) ? dashboardData.earnings[t.ticker] : null;
+  if (earningsEvents && earningsEvents.length > 0) {
+    const next = earningsEvents[0];
+    const d = new Date(next.date + 'T00:00:00');
+    const dateStr = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    earningsBadge = `<span class="earnings-badge" title="Earnings: ${next.date} ${next.when || ''}">📅 ${dateStr}</span>`;
+  }
   // Why-it's-trending section: top 1-2 post titles, or placeholder if none
   let whyHtml;
   if (tickerPosts.length > 0) {
@@ -2079,7 +2130,7 @@ function renderTickerCard(t, opts = {}) {
         ${isStarred ? '★' : '☆'}
       </span>
       <div style="padding-right: 20px;" ${cardClick}>
-        <div class="sym">$${t.ticker}</div>
+        <div class="sym">$${t.ticker}${earningsBadge}</div>
         <div class="name">${escapeHtml((t.name || '').slice(0, 22))}</div>
       </div>
       <div style="padding-right: 20px;" ${cardClick}>
@@ -2185,25 +2236,31 @@ function renderMacroStrip(macro) {
 }
 
 function renderEarningsCard(earnings) {
-  // Show upcoming earnings for tracked tickers, sorted by date
-  // earnings is {ticker: [event, ...]} dict
+  // Show upcoming earnings, sorted by Reddit buzz (delta) so the most-talked-about
+  // earnings appear first. Within the same buzz level, sort by date.
+  // earnings is {ticker: [event, ...]} dict; each event has reddit_mentions and
+  // reddit_delta (set server-side in build_dashboard_payload).
   const all = [];
   for (const ticker in (earnings || {})) {
     for (const ev of earnings[ticker]) {
       all.push({ticker, ...ev});
     }
   }
-  all.sort((a, b) => (a.date || '').localeCompare(b.date || ''));
   if (all.length === 0) {
     return `<div class="card">
       <h2>📅 Upcoming Earnings</h2>
       <div class="empty" style="padding:14px 0;">No earnings for tracked tickers in the next 14 days.</div>
     </div>`;
   }
-  // Take the first 8
-  const top = all.slice(0, 8);
+  // Sort: by reddit delta desc (most discussed first), then by date
+  all.sort((a, b) => {
+    const dDelta = (b.reddit_delta || 0) - (a.reddit_delta || 0);
+    if (dDelta !== 0) return dDelta;
+    return (a.date || '').localeCompare(b.date || '');
+  });
+  const top = all.slice(0, 10);
   return `<div class="card grid-full">
-    <h2>📅 Upcoming Earnings (next 14 days)</h2>
+    <h2>📅 Upcoming Earnings <span style="font-size:11px;font-weight:normal;color:var(--muted);text-transform:none;letter-spacing:0;">— sorted by Reddit buzz</span></h2>
     <div style="overflow-x:auto;">
       <table class="earnings-table">
         <thead>
@@ -2214,6 +2271,7 @@ function renderEarningsCard(earnings) {
             <th>When</th>
             <th>EPS Est.</th>
             <th># Est.</th>
+            <th>🔥 Reddit</th>
           </tr>
         </thead>
         <tbody>
@@ -2222,19 +2280,29 @@ function renderEarningsCard(earnings) {
             const dayName = d.toLocaleDateString('en-US', { weekday: 'short' });
             const dateStr = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
             const isToday = ev.date === new Date().toISOString().slice(0, 10);
+            const delta = ev.reddit_delta || 0;
+            const mentions = ev.reddit_mentions || 0;
+            // Visual indicators
+            const hotBadge = delta >= 50 ? '<span class="earnings-hot">🔥</span>' : '';
+            const deltaClass = delta > 0 ? 'positive' : (delta < 0 ? 'negative' : 'flat');
+            const deltaStr = delta > 0 ? `+${delta}` : `${delta}`;
             return `<tr>
               <td><strong>${dateStr}</strong> <span style="color:var(--muted);font-size:11px;">${dayName}${isToday ? ' (TODAY)' : ''}</span></td>
-              <td><a href="/ticker/${ev.ticker}" style="color:var(--accent);text-decoration:none;font-weight:600;">$${escapeHtml(ev.ticker)}</a></td>
+              <td><a href="/ticker/${ev.ticker}" style="color:var(--accent);text-decoration:none;font-weight:600;">$${escapeHtml(ev.ticker)}</a>${hotBadge}</td>
               <td style="color:var(--muted);">${escapeHtml((ev.name || '').slice(0, 28))}</td>
               <td style="color:var(--muted);font-size:12px;">${escapeHtml(ev.when || 'Time TBD')}</td>
               <td style="font-variant-numeric:tabular-nums;">${escapeHtml(ev.eps_forecast || '—')}</td>
               <td style="color:var(--muted);">${escapeHtml(ev.no_of_ests || '—')}</td>
+              <td style="font-variant-numeric:tabular-nums;font-size:12px;" title="${mentions} total mentions in 24h">
+                <span class="buzz-${deltaClass}">${deltaStr}</span>
+                <span style="color:var(--muted);font-size:10px;"> · ${mentions}m</span>
+              </td>
             </tr>`;
           }).join('')}
         </tbody>
       </table>
     </div>
-    ${all.length > 8 ? `<div style="text-align:center;color:var(--muted);font-size:12px;margin-top:8px;">+${all.length - 8} more</div>` : ''}
+    ${all.length > 10 ? `<div style="text-align:center;color:var(--muted);font-size:12px;margin-top:8px;">+${all.length - 10} more (lower Reddit activity)</div>` : ''}
   </div>`;
 }
 
