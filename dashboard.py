@@ -1383,7 +1383,14 @@ TEMPLATE = r"""
   .grid { display: grid; grid-template-columns: 1fr; gap: 16px; }
   @media (min-width: 720px) { .grid { grid-template-columns: 1fr 1fr; } .grid-full { grid-column: 1 / -1; } }
   .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
-  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); margin: 0 0 12px 0; font-weight: 600; }
+  .card h2 {
+    font-size: 14px;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    color: var(--muted);
+    margin: 0 0 14px 0;
+    font-weight: 700;
+  }
   .row { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--border); gap: 10px; }
   .row:last-child { border-bottom: none; }
   .row .lbl { color: var(--text); display: flex; align-items: center; gap: 8px; min-width: 0; }
@@ -1400,58 +1407,107 @@ TEMPLATE = r"""
   .post-meta .sub { color: var(--accent); font-weight: 500; }
   .post-meta .score { color: var(--green); }
   .ticker-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 8px; }
+  /* ----- Ticker card (used everywhere - the workhorse) ----- */
   .ticker-card {
     background: var(--panel-2);
     border: 1px solid var(--border);
-    padding: 10px 12px;
-    border-radius: 6px;
+    padding: 12px 12px 10px;
+    border-radius: 8px;
     cursor: pointer;
-    transition: all 0.15s;
+    transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
     position: relative;
+    overflow: hidden;
   }
-  .ticker-card:hover { border-color: var(--accent); transform: translateY(-1px); }
-  .ticker-card .sym { font-weight: 700; color: var(--accent); font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 14px; }
-  .ticker-card .name { font-size: 11px; color: var(--muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .ticker-card .price-row { display: flex; justify-content: space-between; align-items: baseline; margin-top: 6px; font-size: 12px; }
+  .ticker-card::before {
+    /* Subtle left accent stripe that hints at direction */
+    content: '';
+    position: absolute;
+    left: 0; top: 0; bottom: 0;
+    width: 3px;
+    background: var(--muted);
+    opacity: 0.5;
+  }
+  .ticker-card.up::before { background: var(--green); opacity: 0.8; }
+  .ticker-card.down::before { background: var(--red); opacity: 0.8; }
+  .ticker-card:hover {
+    border-color: var(--accent);
+    transform: translateY(-2px);
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+  }
+  .ticker-card .sym {
+    font-weight: 700;
+    color: var(--accent);
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 16px;
+    letter-spacing: 0.3px;
+  }
+  .ticker-card .name {
+    font-size: 11px;
+    color: var(--muted);
+    margin-top: 1px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .ticker-card .price-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-top: 8px;
+  }
   .ticker-card .price {
     color: var(--text);
     font-weight: 600;
+    font-size: 15px;
     font-variant-numeric: tabular-nums;
     transition: color 0.6s ease-out;
   }
   .ticker-card .price.flash-up { color: var(--green); }
   .ticker-card .price.flash-down { color: var(--red); }
-  .ticker-card .change { font-weight: 600; font-size: 11px; padding: 1px 5px; border-radius: 3px; font-variant-numeric: tabular-nums; }
-  .ticker-card .change.up { color: var(--green); background: rgba(63, 185, 80, 0.12); }
-  .ticker-card .change.down { color: var(--red); background: rgba(248, 81, 73, 0.12); }
+  .ticker-card .change {
+    font-weight: 600;
+    font-size: 11px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .ticker-card .change.up { color: var(--green); background: rgba(63, 185, 80, 0.15); }
+  .ticker-card .change.down { color: var(--red); background: rgba(248, 81, 73, 0.15); }
   .ticker-card .change.flat { color: var(--muted); background: rgba(139, 148, 158, 0.12); }
-  .ticker-card .sparkline { margin-top: 6px; height: 28px; }
+  .ticker-card .sparkline { margin-top: 8px; height: 30px; }
   .ticker-card .sparkline path { fill: none; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
   .ticker-card .sparkline .up { stroke: var(--green); }
   .ticker-card .sparkline .down { stroke: var(--red); }
   .ticker-card .sparkline .flat { stroke: var(--muted); }
-  .ticker-card .star { position: absolute; top: 6px; right: 8px; color: var(--muted); font-size: 14px; line-height: 1; cursor: pointer; user-select: none; transition: color 0.15s; }
-  .ticker-card .star:hover { color: var(--gold); }
+  .ticker-card .star {
+    position: absolute;
+    top: 8px;
+    right: 10px;
+    color: var(--muted);
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+    user-select: none;
+    transition: color 0.15s, transform 0.15s;
+  }
+  .ticker-card .star:hover { color: var(--gold); transform: scale(1.2); }
   .ticker-card .star.starred { color: var(--gold); }
   .ticker-card .no-price { color: var(--muted); font-size: 11px; margin-top: 6px; font-style: italic; }
   .ticker-card .why-trending {
     margin-top: 8px;
     padding-top: 8px;
     border-top: 1px dashed var(--border);
-    min-height: 60px;  /* reserve space so cards line up even when empty */
+    min-height: 60px;
   }
-  .ticker-card .why-trending.empty {
-    border-top: none;
-    padding-top: 0;
-    margin-top: 4px;
-  }
+  .ticker-card .why-trending.empty { border-top: none; padding-top: 0; margin-top: 4px; }
   .ticker-card .why-label {
     font-size: 9px;
     text-transform: uppercase;
     color: var(--muted);
     margin-bottom: 4px;
-    letter-spacing: 0.3px;
-    font-weight: 600;
+    letter-spacing: 0.4px;
+    font-weight: 700;
   }
   .ticker-card .why-label.no-data { color: var(--border); }
   .ticker-card .why-post {
@@ -1459,9 +1515,9 @@ TEMPLATE = r"""
     font-size: 11px;
     color: var(--text);
     text-decoration: none;
-    line-height: 1.35;
+    line-height: 1.4;
     padding: 3px 0;
-    opacity: 0.88;
+    opacity: 0.9;
   }
   .ticker-card .why-post:hover { color: var(--accent); opacity: 1; }
   .ticker-card .why-post .meta {
@@ -1582,16 +1638,19 @@ TEMPLATE = r"""
     color: var(--muted);
     font-size: 10px;
     text-transform: uppercase;
-    font-weight: 600;
-    letter-spacing: 0.3px;
-    padding: 6px 8px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    padding: 10px 12px;
     border-bottom: 1px solid var(--border);
   }
   .earnings-table td {
-    padding: 8px;
+    padding: 10px 12px;
     border-bottom: 1px solid var(--border);
   }
   .earnings-table tr:last-child td { border-bottom: none; }
+  .earnings-table tr {
+    transition: background 0.15s;
+  }
   .earnings-table tr:hover td { background: var(--panel-2); }
   .earnings-table .buzz-positive { color: var(--green); font-weight: 600; }
   .earnings-table .buzz-negative { color: var(--red); font-weight: 600; }
@@ -1642,12 +1701,12 @@ TEMPLATE = r"""
     position: sticky;
     top: 0;
     z-index: 50;
-    background: rgba(13, 17, 23, 0.92);
-    backdrop-filter: blur(8px);
-    -webkit-backdrop-filter: blur(8px);
+    background: rgba(13, 17, 23, 0.85);
+    backdrop-filter: blur(12px) saturate(180%);
+    -webkit-backdrop-filter: blur(12px) saturate(180%);
     border-bottom: 1px solid var(--border);
-    padding: 8px 0;
-    margin: 0 -8px 12px -8px;
+    padding: 10px 0;
+    margin: 0 -8px 16px -8px;
     padding-left: 8px;
     padding-right: 8px;
     overflow-x: auto;
@@ -1656,46 +1715,44 @@ TEMPLATE = r"""
     gap: 6px;
   }
   .section-nav button {
-    background: transparent;
+    background: var(--panel);
     border: 1px solid var(--border);
     color: var(--muted);
-    padding: 5px 10px;
-    border-radius: 4px;
+    padding: 6px 12px;
+    border-radius: 16px;
     font-size: 11px;
     cursor: pointer;
     flex-shrink: 0;
     font-family: inherit;
-  }
-  .section-nav button.active {
-    background: var(--accent);
-    color: white;
-    border-color: var(--accent);
+    transition: all 0.15s;
   }
   .section-nav button:hover {
     color: var(--text);
     border-color: var(--muted);
+    transform: translateY(-1px);
   }
 
-  /* ----- Today's moves summary bar ----- */
+  /* ----- Today's moves summary bar (the hero) ----- */
   .todays-moves {
-    background: linear-gradient(135deg, var(--panel) 0%, var(--panel-2) 100%);
-    border: 1px solid var(--accent);
-    border-radius: 8px;
-    padding: 10px 14px;
-    margin-bottom: 12px;
+    background: linear-gradient(135deg, rgba(88, 166, 255, 0.12) 0%, rgba(210, 153, 34, 0.06) 100%);
+    border: 1px solid rgba(88, 166, 255, 0.4);
+    border-radius: 10px;
+    padding: 12px 16px;
+    margin-bottom: 14px;
     display: flex;
     align-items: center;
     flex-wrap: wrap;
-    gap: 6px 12px;
+    gap: 8px 14px;
     font-size: 12px;
+    box-shadow: 0 2px 12px rgba(88, 166, 255, 0.08);
   }
   .todays-moves .move {
     display: inline-flex;
     align-items: center;
     gap: 4px;
-    padding: 2px 6px;
-    border-radius: 3px;
-    background: var(--panel-2);
+    padding: 3px 7px;
+    border-radius: 5px;
+    background: rgba(13, 17, 23, 0.6);
   }
   .todays-moves .move.up { color: var(--green); }
   .todays-moves .move.down { color: var(--red); }
@@ -1705,6 +1762,7 @@ TEMPLATE = r"""
     font-size: 10px;
     text-transform: uppercase;
     letter-spacing: 0.5px;
+    font-weight: 700;
   }
   .todays-moves .ticker-link {
     color: var(--accent);
@@ -1714,6 +1772,7 @@ TEMPLATE = r"""
   }
   .todays-moves .sep {
     color: var(--border);
+    opacity: 0.5;
   }
 
   /* ----- Mode toggle (compact) ----- */
@@ -1797,9 +1856,13 @@ TEMPLATE = r"""
   }
   .watchlist-ticker-news {
     background: var(--panel-2);
-    border-radius: 6px;
-    padding: 12px;
+    border-radius: 8px;
+    padding: 14px;
     border: 1px solid var(--border);
+    transition: border-color 0.15s, transform 0.15s;
+  }
+  .watchlist-ticker-news:hover {
+    border-color: rgba(88, 166, 255, 0.3);
   }
   .watchlist-ticker-news h4 {
     margin: 0 0 6px 0;
@@ -1827,15 +1890,18 @@ TEMPLATE = r"""
     display: block;
     text-decoration: none;
     color: var(--text);
-    padding: 6px 0;
+    padding: 8px 0;
     border-bottom: 1px solid var(--border);
+    transition: color 0.15s;
   }
   .news-item:last-child { border-bottom: none; }
+  .news-item:hover { color: var(--accent); }
   .news-item:hover .news-title { color: var(--accent); }
   .news-title {
-    font-size: 12px;
+    font-size: 12.5px;
     line-height: 1.4;
-    margin-bottom: 3px;
+    margin-bottom: 4px;
+    font-weight: 500;
   }
   .news-meta {
     display: flex;
@@ -1859,27 +1925,30 @@ TEMPLATE = r"""
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    border-radius: 6px;
+    border-radius: 8px;
     color: var(--text);
     text-decoration: none;
-    transition: transform 0.15s, box-shadow 0.15s;
+    transition: transform 0.18s, box-shadow 0.18s;
     min-width: 70px;
-    border: 1px solid rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.06);
+    box-shadow: 0 1px 3px rgba(0,0,0,0.2);
   }
   .heatmap-cell:hover {
-    transform: scale(1.08);
-    box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+    transform: scale(1.1) translateY(-2px);
+    box-shadow: 0 8px 24px rgba(0,0,0,0.5);
     z-index: 1;
   }
   .heatmap-cell .heatmap-sym {
-    font-size: 12px;
+    font-size: 13px;
     font-weight: 700;
     font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    letter-spacing: 0.2px;
   }
   .heatmap-cell .heatmap-chg {
     font-size: 10px;
     font-weight: 600;
-    margin-top: 2px;
+    margin-top: 3px;
+    font-variant-numeric: tabular-nums;
   }
 
   /* ----- Error / stale banners ----- */
@@ -2456,8 +2525,12 @@ function renderTickerCard(t, opts = {}) {
       </div>
     `;
   }
+  // Direction class for left accent stripe
+  let dirClass = '';
+  if (p && p.change_pct > 0.05) dirClass = 'up';
+  else if (p && p.change_pct < -0.05) dirClass = 'down';
   return `
-    <div class="ticker-card" data-ticker="${t.ticker}" data-sub="${opts.sub || ''}" data-name="${escapeHtml(t.name || '')}">
+    <div class="ticker-card ${dirClass}" data-ticker="${t.ticker}" data-sub="${opts.sub || ''}" data-name="${escapeHtml(t.name || '')}">
       <span class="star ${isStarred ? 'starred' : ''}" data-ticker="${t.ticker}"
             onclick="event.stopPropagation(); toggleStar('${t.ticker}')"
             title="${isStarred ? 'Remove from watchlist' : 'Add to watchlist'}">
