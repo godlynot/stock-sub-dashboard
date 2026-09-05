@@ -515,6 +515,66 @@ def fetch_fred_series(series_id: str) -> dict | None:
         return None
 
 
+def fetch_yahoo_news(ticker: str, max_headlines: int = 5) -> list[dict]:
+    """
+    Fetch recent news headlines for a ticker from Yahoo Finance.
+    Returns [{title, publisher, link, published_at (ISO), thumbnail, related_tickers}].
+    Free, no auth needed via /v1/finance/search.
+    """
+    try:
+        url = f"https://query1.finance.yahoo.com/v1/finance/search?q={ticker}&newsCount={max_headlines}"
+        resp = _yahoo_session.get(url, timeout=YAHOO_TIMEOUT)
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+        news = data.get("news", [])
+        out = []
+        for n in news:
+            ts = n.get("providerPublishTime")
+            from datetime import datetime, timezone
+            iso = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts else None
+            thumb = None
+            if n.get("thumbnail"):
+                resolutions = n["thumbnail"].get("resolutions", [])
+                if resolutions:
+                    thumb = resolutions[0].get("url")
+            out.append({
+                "title": n.get("title", ""),
+                "publisher": n.get("publisher", ""),
+                "link": n.get("link", ""),
+                "published_at": iso,
+                "thumbnail": thumb,
+                "related_tickers": n.get("relatedTickers", []),
+                "type": n.get("type", ""),
+            })
+        return out
+    except Exception as e:
+        return []
+
+
+def fetch_yahoo_sector(ticker: str) -> dict | None:
+    """
+    Fetch sector and industry tags for a ticker from Yahoo Finance.
+    Returns {sector, industry, name} or None.
+    """
+    try:
+        url = f"https://query1.finance.yahoo.com/v1/finance/search?q={ticker}&newsCount=0"
+        resp = _yahoo_session.get(url, timeout=YAHOO_TIMEOUT)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        for q in data.get("quotes", []):
+            if q.get("symbol") == ticker and q.get("quoteType") == "EQUITY":
+                return {
+                    "sector": q.get("sector") or "",
+                    "industry": q.get("industry") or "",
+                    "name": q.get("longname") or q.get("shortname") or ticker,
+                }
+        return None
+    except Exception:
+        return None
+
+
 def fetch_yahoo_quote(ticker: str) -> dict | None:
     """
     Fetch a single price quote from Yahoo Finance.
@@ -1186,6 +1246,50 @@ def api_earnings():
         return jsonify({"error": str(e)}), 500
 
 
+# Per-ticker news + sector cache (key = ticker, value = {news, sector, fetched_at})
+news_cache: dict[str, dict] = {}
+NEWS_CACHE_TTL = int(os.getenv("NEWS_CACHE_TTL", "1800"))  # 30 min (news doesn't change fast)
+
+
+@app.route("/api/watchlist_data")
+def api_watchlist_data():
+    """
+    For a list of watchlist tickers, return news headlines + sector tags.
+    The watchlist is on the client (localStorage), so this endpoint takes
+    ?tickers=AAPL,TSLA,NVDA and returns aggregated data.
+    Cache 30 min per ticker.
+    """
+    raw = request.args.get("tickers", "").strip()
+    if not raw:
+        return jsonify({})
+    tickers = [t.strip().upper() for t in raw.split(",") if t.strip()][:20]  # cap at 20
+    out: dict[str, dict] = {}
+    now = time.time()
+    # 1) Get cached entries that are still fresh
+    to_fetch: list[str] = []
+    for tk in tickers:
+        cached = news_cache.get(tk)
+        if cached and (now - cached.get("fetched_at", 0)) < NEWS_CACHE_TTL:
+            out[tk] = {"news": cached.get("news", []), "sector": cached.get("sector")}
+        else:
+            to_fetch.append(tk)
+    # 2) Fetch missing ones in parallel
+    if to_fetch:
+        import concurrent.futures
+        def _fetch_one(tk: str) -> tuple[str, dict]:
+            return tk, {
+                "news": fetch_yahoo_news(tk, max_headlines=4),
+                "sector": fetch_yahoo_sector(tk),
+            }
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            results = list(ex.map(_fetch_one, to_fetch))
+        for tk, data in results:
+            # Cache it
+            news_cache[tk] = {**data, "fetched_at": time.time()}
+            out[tk] = data
+    return jsonify(out)
+
+
 @app.route("/api/ticker/<ticker>")
 def api_ticker_detail(ticker: str):
     """Ticker detail. Cached for 5 min to avoid 30s+ cold fetches on every click."""
@@ -1652,6 +1756,95 @@ TEMPLATE = r"""
     text-transform: uppercase;
     letter-spacing: 0.2px;
   }
+
+  /* ----- Watchlist performance summary ----- */
+  .watchlist-summary {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+    margin: 8px 0 14px;
+    padding: 10px;
+    background: var(--panel-2);
+    border-radius: 6px;
+  }
+  @media (max-width: 600px) {
+    .watchlist-summary { grid-template-columns: repeat(2, 1fr); }
+  }
+  .ws-stat { text-align: center; }
+  .ws-stat .ws-label {
+    font-size: 10px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    margin-bottom: 2px;
+  }
+  .ws-stat .ws-value {
+    font-size: 14px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  .ws-stat .ws-value.positive { color: var(--green); }
+  .ws-stat .ws-value.negative { color: var(--red); }
+  .ws-stat .ws-value.neutral { color: var(--text); }
+
+  /* ----- Watchlist news ----- */
+  .watchlist-news-area { margin-top: 16px; }
+  .watchlist-news-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 12px;
+    margin-top: 4px;
+  }
+  .watchlist-ticker-news {
+    background: var(--panel-2);
+    border-radius: 6px;
+    padding: 12px;
+    border: 1px solid var(--border);
+  }
+  .watchlist-ticker-news h4 {
+    margin: 0 0 6px 0;
+    font-size: 14px;
+    color: var(--accent);
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  .watchlist-ticker-news .news-tag {
+    display: inline-block;
+    background: rgba(88, 166, 255, 0.15);
+    color: var(--accent);
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 3px;
+    margin-right: 4px;
+    font-weight: 500;
+  }
+  .watchlist-ticker-news .news-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 8px;
+  }
+  .news-item {
+    display: block;
+    text-decoration: none;
+    color: var(--text);
+    padding: 6px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .news-item:last-child { border-bottom: none; }
+  .news-item:hover .news-title { color: var(--accent); }
+  .news-title {
+    font-size: 12px;
+    line-height: 1.4;
+    margin-bottom: 3px;
+  }
+  .news-meta {
+    display: flex;
+    gap: 8px;
+    font-size: 10px;
+    color: var(--muted);
+  }
+  .news-publisher { color: var(--muted); }
+  .news-time { color: var(--muted); }
 
   /* ----- Heatmap ----- */
   .heatmap-grid {
@@ -2627,7 +2820,6 @@ function renderWatchlistSection() {
   const prices = (dashboardData && dashboardData.prices) || {};
   const cards = [];
   // Gather from per_sub_top (any sub) + cross_sub_leaderboard
-  const seen = new Set();
   const allKnown = {};
   for (const [sub, list] of Object.entries(dashboardData.per_sub_top || {})) {
     for (const t of list) {
@@ -2645,14 +2837,135 @@ function renderWatchlistSection() {
     const t = allKnown[ticker] || { ticker, name: '', mentions: 0, upvotes: 0 };
     cards.push(renderTickerCard(t, {sub: 'watchlist'}));
   }
+  // Build a summary row + performance section above the cards
+  const performance = renderWatchlistPerformance(watchlist, prices);
   return `
     <div class="card watchlist-section">
       <h2>⭐ My Watchlist (${watchlist.length})</h2>
+      ${performance}
       <div class="ticker-grid">
         ${cards.join('')}
       </div>
+      <div id="watchlist-news" class="watchlist-news-area"></div>
     </div>
   `;
+}
+
+function renderWatchlistPerformance(watchlist, prices) {
+  // Aggregate: average change %, best, worst, count
+  const valid = watchlist.filter(t => prices[t] && prices[t].price);
+  if (valid.length === 0) return '';
+  const changes = valid.map(t => prices[t].change_pct || 0);
+  const avg = changes.reduce((a, b) => a + b, 0) / changes.length;
+  const best = valid.reduce((a, b) =>
+    (prices[a].change_pct || 0) > (prices[b].change_pct || 0) ? a : b);
+  const worst = valid.reduce((a, b) =>
+    (prices[a].change_pct || 0) < (prices[b].change_pct || 0) ? a : b);
+  const bestChange = prices[best].change_pct;
+  const worstChange = prices[worst].change_pct;
+  const avgClass = avg >= 0 ? 'positive' : 'negative';
+  const avgStr = avg >= 0 ? `+${avg.toFixed(2)}%` : `${avg.toFixed(2)}%`;
+  return `
+    <div class="watchlist-summary">
+      <div class="ws-stat">
+        <div class="ws-label">Your list today</div>
+        <div class="ws-value ${avgClass}">${avgStr}</div>
+      </div>
+      <div class="ws-stat">
+        <div class="ws-label">Best</div>
+        <div class="ws-value positive">$${best} +${bestChange.toFixed(2)}%</div>
+      </div>
+      <div class="ws-stat">
+        <div class="ws-label">Worst</div>
+        <div class="ws-value negative">$${worst} ${worstChange.toFixed(2)}%</div>
+      </div>
+      <div class="ws-stat">
+        <div class="ws-label">Tickers</div>
+        <div class="ws-value neutral">${valid.length} of ${watchlist.length}</div>
+      </div>
+    </div>
+  `;
+}
+
+let _watchlistNews = {};  // cached news data per ticker (for the watchlist)
+async function loadWatchlistNews() {
+  // Fetch news + sector data for the user's watchlist
+  const watchlist = getWatchlist();
+  if (watchlist.length === 0) return;
+  const area = document.getElementById('watchlist-news');
+  if (!area) return;
+  try {
+    const resp = await fetch(`/api/watchlist_data?tickers=${watchlist.join(',')}`);
+    if (!resp.ok) return;
+    _watchlistNews = await resp.json();
+    renderWatchlistNews();
+  } catch (e) {
+    console.error('Watchlist news fetch failed:', e);
+  }
+}
+
+function renderWatchlistNews() {
+  const area = document.getElementById('watchlist-news');
+  if (!area) return;
+  const watchlist = getWatchlist();
+  if (watchlist.length === 0) {
+    area.innerHTML = '';
+    return;
+  }
+  // Sort tickers by mention count (from cross_sub_leaderboard) so the most-discussed show first
+  const mentionBy = {};
+  for (const sub in (dashboardData.per_sub_top || {})) {
+    for (const t of (dashboardData.per_sub_top[sub] || [])) {
+      mentionBy[t.ticker] = (mentionBy[t.ticker] || 0) + (t.mentions || 0);
+    }
+  }
+  for (const t of (dashboardData.cross_sub_leaderboard || [])) {
+    mentionBy[t.ticker] = (mentionBy[t.ticker] || 0) + (t.total_mentions || 0);
+  }
+  const sorted = [...watchlist].sort((a, b) => (mentionBy[b] || 0) - (mentionBy[a] || 0));
+  const sections = sorted.map(tk => {
+    const data = _watchlistNews[tk] || {};
+    const news = data.news || [];
+    const sector = data.sector || {};
+    if (news.length === 0 && !sector.sector) return '';
+    const sectorLine = sector.sector
+      ? `<div class="news-meta">
+           <span class="news-tag">${escapeHtml(sector.sector)}</span>
+           ${sector.industry ? `<span class="news-tag">${escapeHtml(sector.industry)}</span>` : ''}
+         </div>`
+      : '';
+    const headlines = news.slice(0, 3).map(n => {
+      const ago = n.published_at ? formatTimeAgo(n.published_at) : '';
+      const fullDate = n.published_at ? new Date(n.published_at).toLocaleString() : '';
+      return `<a class="news-item" href="${escapeHtml(n.link)}" target="_blank" rel="noopener">
+        <div class="news-title">${escapeHtml(n.title)}</div>
+        <div class="news-meta">
+          <span class="news-publisher">${escapeHtml(n.publisher || '?')}</span>
+          ${ago ? `<span class="news-time" title="${escapeHtml(fullDate)}">${ago}</span>` : ''}
+        </div>
+      </a>`;
+    }).join('');
+    if (!headlines) return '';
+    return `<div class="watchlist-ticker-news">
+      <h4>$${escapeHtml(tk)}</h4>
+      ${sectorLine}
+      <div class="news-list">${headlines}</div>
+    </div>`;
+  }).filter(s => s);
+  area.innerHTML = sections.length > 0
+    ? `<h3 style="margin: 18px 0 10px 0; font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px;">📰 News for your watchlist</h3><div class="watchlist-news-grid">${sections.join('')}</div>`
+    : '';
+}
+
+function formatTimeAgo(isoString) {
+  const then = new Date(isoString).getTime();
+  const now = Date.now();
+  const diffSec = Math.round((now - then) / 1000);
+  if (diffSec < 60) return 'just now';
+  if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m ago`;
+  if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h ago`;
+  if (diffSec < 604800) return `${Math.floor(diffSec / 86400)}d ago`;
+  return new Date(isoString).toLocaleDateString();
 }
 
 function render(d) {
@@ -2838,6 +3151,8 @@ function render(d) {
   flashPriceChanges();
   // Animate count-up of the macro indicator values (only on first load)
   setTimeout(() => animateCountUp('.macro-cell .macro-val'), 100);
+  // Load watchlist news (async, doesn't block render)
+  loadWatchlistNews();
 }
 
 const _lastPrices = {};
