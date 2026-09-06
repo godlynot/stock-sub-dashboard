@@ -2379,6 +2379,13 @@ TEMPLATE = r"""
     text-align: right;
     padding: 4px 14px 8px;
   }
+  @keyframes pageFadeIn {
+    from { opacity: 0; transform: translateY(16px); }
+    to { opacity: 1; transform: none; }
+  }
+  main {
+    animation: pageFadeIn 0.3s ease forwards;
+  }
 </style>
 </head>
 <body>
