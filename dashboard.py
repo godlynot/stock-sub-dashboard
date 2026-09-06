@@ -515,6 +515,115 @@ def fetch_fred_series(series_id: str) -> dict | None:
         return None
 
 
+def _sec_headers() -> dict:
+    """SEC.gov requires identifying User-Agent (will 403 without it)."""
+    return {
+        "User-Agent": "StockSubDashboard research@example.com",
+        "Accept-Encoding": "gzip, deflate",
+    }
+
+
+def _sec_get_json(url: str, timeout: int = 15) -> dict | None:
+    """GET a JSON from SEC.gov, handling gzip and 403/404 errors gracefully."""
+    try:
+        req = urllib.request.Request(url, headers=_sec_headers())
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read()
+            if r.headers.get("Content-Encoding") == "gzip":
+                import gzip
+                raw = gzip.decompress(raw)
+            return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+
+
+# CIK map: {ticker_upper: cik_string} - cache forever (CIKs rarely change)
+_sec_cik_map: dict[str, str] = {}
+_sec_cik_map_loaded_at: float = 0
+SEC_CIK_CACHE_TTL = 86400  # refresh once a day
+
+
+def _load_sec_cik_map() -> dict[str, str]:
+    """Load the SEC ticker-to-CIK map. Returns {TICKER: cik_str}."""
+    global _sec_cik_map, _sec_cik_map_loaded_at
+    now = time.time()
+    if _sec_cik_map and (now - _sec_cik_map_loaded_at) < SEC_CIK_CACHE_TTL:
+        return _sec_cik_map
+    data = _sec_get_json("https://www.sec.gov/files/company_tickers.json", timeout=20)
+    if not data:
+        return _sec_cik_map  # return stale if can't refresh
+    out: dict[str, str] = {}
+    for _key, val in data.items():
+        t = val.get("ticker", "").upper()
+        cik = val.get("cik_str", "")
+        if t and cik:
+            out[t] = str(cik)
+    _sec_cik_map = out
+    _sec_cik_map_loaded_at = now
+    return out
+
+
+def fetch_sec_filings(ticker: str, max_filings: int = 3) -> list[dict]:
+    """
+    Fetch recent 8-K (material event) filings for a ticker from SEC EDGAR.
+    Returns [{date, form, title, link}] sorted by date desc.
+    Free, no auth (just requires User-Agent).
+    """
+    cik_map = _load_sec_cik_map()
+    cik = cik_map.get(ticker.upper())
+    if not cik:
+        return []
+    # Pad to 10 digits
+    cik_padded = cik.zfill(10)
+    url = f"https://data.sec.gov/submissions/CIK{cik_padded}.json"
+    data = _sec_get_json(url, timeout=15)
+    if not data:
+        return []
+    name = data.get("name", ticker.upper())
+    recent = data.get("filings", {}).get("recent", {})
+    forms = recent.get("form", [])
+    dates = recent.get("filingDate", [])
+    items = recent.get("items", [])
+    primary_docs = recent.get("primaryDocument", [])
+    # Form type labels (most common)
+    form_labels = {
+        "8-K": "Material event",
+        "4": "Insider transaction",
+        "10-K": "Annual report",
+        "10-Q": "Quarterly report",
+        "S-1": "IPO registration",
+        "13D": "Large stake acquired",
+        "13G": "Large stake (passive)",
+    }
+    out: list[dict] = []
+    for i, (form, date) in enumerate(zip(forms, dates)):
+        if form != "8-K":
+            continue
+        # Build the filing link
+        accession = items[i] if i < len(items) else ""
+        if accession:
+            acc_no_dashes = accession.replace("-", "")
+            # The "filing index" page lists all docs in the filing
+            link = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_no_dashes}/{accession}-index.htm"
+        else:
+            link = ""
+        # Get primary doc name for context
+        doc_name = primary_docs[i] if i < len(primary_docs) else ""
+        # Try to fetch the filing's primary doc for a real title
+        title = form_labels.get(form, form)
+        out.append({
+            "date": date,
+            "form": form,
+            "title": title,
+            "link": link,
+            "doc_name": doc_name,
+            "company": name,
+        })
+        if len(out) >= max_filings:
+            break
+    return out
+
+
 def fetch_yahoo_news(ticker: str, max_headlines: int = 5) -> list[dict]:
     """
     Fetch recent news headlines for a ticker from Yahoo Finance.
@@ -1280,6 +1389,7 @@ def api_watchlist_data():
             return tk, {
                 "news": fetch_yahoo_news(tk, max_headlines=4),
                 "sector": fetch_yahoo_sector(tk),
+                "sec_filings": fetch_sec_filings(tk, max_filings=3),
             }
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
             results = list(ex.map(_fetch_one, to_fetch))
@@ -1943,6 +2053,40 @@ TEMPLATE = r"""
   }
   .news-publisher { color: var(--muted); }
   .news-time { color: var(--muted); }
+
+  /* ----- SEC filings ----- */
+  .filings-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 10px;
+  }
+  .filing-item {
+    display: block;
+    text-decoration: none;
+    color: var(--text);
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .filing-item:hover {
+    border-color: rgba(88, 166, 255, 0.5);
+    background: var(--panel-2);
+  }
+  .filing-title {
+    font-size: 12px;
+    font-weight: 600;
+    margin-bottom: 3px;
+  }
+  .filing-meta {
+    display: flex;
+    gap: 10px;
+    font-size: 10px;
+    color: var(--muted);
+  }
+  .filing-time { color: var(--muted); }
+  .filing-type { color: var(--muted); font-size: 9px; text-transform: uppercase; letter-spacing: 0.3px; }
 
   /* ----- Heatmap ----- */
   .heatmap-grid {
@@ -3023,8 +3167,9 @@ function renderWatchlistNews() {
   const sections = sorted.map(tk => {
     const data = _watchlistNews[tk] || {};
     const news = data.news || [];
+    const secFilings = data.sec_filings || [];
     const sector = data.sector || {};
-    if (news.length === 0 && !sector.sector) return '';
+    if (news.length === 0 && !sector.sector && secFilings.length === 0) return '';
     const sectorLine = sector.sector
       ? `<div class="news-meta">
            <span class="news-tag">${escapeHtml(sector.sector)}</span>
@@ -3042,15 +3187,28 @@ function renderWatchlistNews() {
         </div>
       </a>`;
     }).join('');
-    if (!headlines) return '';
+    const filings = secFilings.slice(0, 2).map(f => {
+      const fullDate = f.date ? new Date(f.date).toLocaleString() : '';
+      const ago = f.date ? formatTimeAgo(f.date + 'T00:00:00') : '';
+      const title = f.title || '8-K Filing';
+      return `<a class="filing-item" href="${escapeHtml(f.link)}" target="_blank" rel="noopener">
+        <div class="filing-title">${escapeHtml(f.title || '8-K Filing')}</div>
+        <div class="filing-meta">
+          ${f.date ? `<span class="filing-time" title="${escapeHtml(fullDate)}">${f.date}</span>` : ''}
+          <span class="filing-type">${escapeHtml(f.title)}</span>
+        </div>
+      </a>`;
+    }).join('');
+    if (!headlines && !filings) return '';
     return `<div class="watchlist-ticker-news">
       <h4>$${escapeHtml(tk)}</h4>
       ${sectorLine}
-      <div class="news-list">${headlines}</div>
+      ${headlines ? `<div class="news-list">${headlines}</div>` : ''}
+      ${filings ? `<div class="filings-list">${filings}</div>` : ''}
     </div>`;
   }).filter(s => s);
   area.innerHTML = sections.length > 0
-    ? `<h3 style="margin: 18px 0 10px 0; font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px;">📰 News for your watchlist</h3><div class="watchlist-news-grid">${sections.join('')}</div>`
+    ? `<h3 style="margin: 18px 0 10px 0; font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px;">📰 News & filings for your watchlist</h3><div class="watchlist-news-grid">${sections.join('')}</div>`
     : '';
 }
 
