@@ -3144,9 +3144,96 @@ function renderWatchlistSection() {
       <div id="watchlist-news" class="watchlist-news-area"></div>
     </div>
   `;
-}
+  }
 
-function renderWatchlistPerformance(watchlist, prices) {
+  function renderPortfolioSection() {
+    const portfolio = getPortfolio();
+    if (Object.keys(portfolio).length === 0) {
+      return `
+        <div class="card portfolio-section">
+          <h2>My Portfolio</h2>
+          <div class="portfolio-empty">
+            Add positions to track your P&L. Click the $ button on any ticker card to add it.
+          </div>
+        </div>
+      `;
+    }
+    const prices = (dashboardData && dashboardData.prices) || {};
+    let totalValue = 0;
+    let totalCost = 0;
+    let totalPnL = 0;
+    const rows = [];
+    for (const [ticker, pos] of Object.entries(portfolio)) {
+      const priceData = prices[ticker];
+      const currentPrice = priceData?.price || pos.costBasis;
+      const changePct = priceData?.change_pct ?? 0;
+      const value = pos.shares * currentPrice;
+      const cost = pos.shares * pos.costBasis;
+      const pnl = value - cost;
+      const pnlPct = cost > 0 ? (pnl / cost) * 100 : 0;
+      totalValue += value;
+      totalCost += cost;
+      totalPnL += pnl;
+      const changeClass = changePct >= 0 ? 'positive' : 'negative';
+      const changeSign = changePct >= 0 ? '+' : '';
+      rows.push(`
+        <div class="portfolio-row">
+          <div class="pos-info">
+            <span class="pos-ticker">$${escapeHtml(ticker)}</span>
+            <span class="pos-name">${escapeHtml(pos.name || '')}</span>
+          </div>
+          <div class="pos-shares">${pos.shares} shares</div>
+          <div class="pos-cost">$${pos.costBasis.toFixed(2)} avg</div>
+          <div class="pos-current">$${currentPrice.toFixed(2)}</div>
+          <div class="pos-change ${changeClass}">${changeSign}${changePct.toFixed(2)}%</div>
+          <div class="pos-value">$${value.toFixed(2)}</div>
+          <div class="pos-pnl ${changeClass}">${changeSign}$${pnl.toFixed(2)} (${changeSign}${pnlPct.toFixed(2)}%)</div>
+        </div>
+      `);
+    }
+    totalPnLPercent = totalCost > 0 ? (totalPnL / totalCost) * 100 : 0;
+    const totalPnLClass = totalPnL >= 0 ? 'positive' : 'negative';
+    const totalPnLSign = totalPnL >= 0 ? '+' : '';
+    return `
+      <div class="card portfolio-section">
+        <h2>My Portfolio <span class="header-sub">${Object.keys(portfolio).length} position${Object.keys(portfolio).length === 1 ? '' : 's'}</span></h2>
+        <div class="portfolio-summary">
+          <div class="port-stat">
+            <div class="port-label">Total Value</div>
+            <div class="port-value">$${totalValue.toFixed(2)}</div>
+          </div>
+          <div class="port-stat">
+            <div class="port-label">Total P&L</div>
+            <div class="port-value ${totalPnLClass}">${totalPnLSign}$${totalPnL.toFixed(2)} (${totalPnLSign}${totalPnLPercent.toFixed(2)}%)</div>
+          </div>
+          <div class="port-stat">
+            <div class="port-label">Cost Basis</div>
+            <div class="port-value">$${totalCost.toFixed(2)}</div>
+          </div>
+          <div class="port-stat">
+            <div class="port-label">Positions</div>
+            <div class="port-value neutral">${Object.keys(portfolio).length}</div>
+          </div>
+        </div>
+        <div class="portfolio-table">
+          <div class="portfolio-header">
+            <div class="pos-info">Position</div>
+            <div class="pos-shares">Shares</div>
+            <div class="pos-cost">Avg Cost</div>
+            <div class="pos-current">Current</div>
+            <div class="pos-change">Change</div>
+            <div class="pos-value">Value</div>
+            <div class="pos-pnl">P&L</div>
+          </div>
+          <div class="portfolio-rows">
+            ${rows.join('')}
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderWatchlistPerformance(watchlist, prices) {
   // Aggregate: average change %, best, worst, count
   // Render as a sentence instead of stat blocks - feels more human
   const valid = watchlist.filter(t => prices[t] && prices[t].price);
@@ -3344,6 +3431,10 @@ function render(d) {
     </div>
     <div id="sec-watchlist">
       ${renderWatchlistSection()}
+    </div>
+
+    <div id="sec-portfolio">
+      ${renderPortfolioSection()}
     </div>
 
     <div class="card">
