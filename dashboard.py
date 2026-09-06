@@ -1773,18 +1773,51 @@ TEMPLATE = r"""
     border-radius: 6px;
     padding: 10px 12px;
     min-height: 110px;
+    opacity: 0;
+    animation: cardEntrance 0.35s ease forwards;
   }
   .skeleton-card .skeleton { margin: 6px 0; }
   .skeleton-card .skeleton.s1 { width: 40%; height: 14px; }
   .skeleton-card .skeleton.s2 { width: 70%; height: 10px; }
   .skeleton-card .skeleton.s3 { width: 90%; height: 10px; }
   .skeleton-card .skeleton.s4 { width: 50%; height: 28px; margin-top: 12px; }
-  .skel-step {
-    display: inline-block;
-    padding: 2px 6px;
-    background: var(--panel-2);
-    border-radius: 3px;
-    margin-right: 4px;
+
+  .skeleton-card:nth-child(1)  { animation-delay: 0ms; }
+  .skeleton-card:nth-child(2)  { animation-delay: 30ms; }
+  .skeleton-card:nth-child(3)  { animation-delay: 60ms; }
+  .skeleton-card:nth-child(4)  { animation-delay: 90ms; }
+  .skeleton-card:nth-child(5)  { animation-delay: 120ms; }
+  .skeleton-card:nth-child(6)  { animation-delay: 150ms; }
+  .skeleton-card:nth-child(7)  { animation-delay: 150ms; }
+  .skeleton-card:nth-child(8)  { animation-delay: 180ms; }
+  .skeleton-card:nth-child(9)  { animation-delay: 180ms; }
+  .skeleton-card:nth-child(10) { animation-delay: 210ms; }
+  .skeleton-card:nth-child(11) { animation-delay: 210ms; }
+  .skeleton-card:nth-child(12) { animation-delay: 240ms; }
+  .skeleton-card:nth-child(n+13) { animation-delay: 240ms; }
+
+  /* Staggered card entrance for ticker cards */
+  .ticker-grid .ticker-card {
+    opacity: 0;
+    animation: cardEntrance 0.35s ease forwards;
+  }
+  .ticker-grid .ticker-card:nth-child(1)  { animation-delay: 0ms; }
+  .ticker-grid .ticker-card:nth-child(2)  { animation-delay: 30ms; }
+  .ticker-grid .ticker-card:nth-child(3)  { animation-delay: 60ms; }
+  .ticker-grid .ticker-card:nth-child(4)  { animation-delay: 90ms; }
+  .ticker-grid .ticker-card:nth-child(5)  { animation-delay: 120ms; }
+  .ticker-grid .ticker-card:nth-child(6)  { animation-delay: 150ms; }
+  .ticker-grid .ticker-card:nth-child(7)  { animation-delay: 150ms; }
+  .ticker-grid .ticker-card:nth-child(8)  { animation-delay: 180ms; }
+  .ticker-grid .ticker-card:nth-child(9)  { animation-delay: 180ms; }
+  .ticker-grid .ticker-card:nth-child(10) { animation-delay: 210ms; }
+  .ticker-grid .ticker-card:nth-child(11) { animation-delay: 210ms; }
+  .ticker-grid .ticker-card:nth-child(12) { animation-delay: 240ms; }
+  .ticker-grid .ticker-card:nth-child(n+13) { animation-delay: 240ms; }
+
+  @keyframes cardEntrance {
+    from { opacity: 0; transform: translateY(12px); }
+    to { opacity: 1; transform: translateY(0); }
   }
 
   /* ----- Earnings table ----- */
@@ -3745,6 +3778,13 @@ TICKER_PAGE_TEMPLATE = r"""
   .empty { color: var(--muted); font-style: italic; padding: 20px 0; text-align: center; }
   .loading { text-align: center; padding: 40px; color: var(--muted); }
   .footer { text-align: center; color: var(--muted); font-size: 11px; padding: 20px; border-top: 1px solid var(--border); margin-top: 30px; }
+  @keyframes pageFadeIn {
+    from { opacity: 0; transform: translateY(16px); }
+    to { opacity: 1; transform: none; }
+  }
+  main {
+    animation: pageFadeIn 0.3s ease forwards;
+  }
 </style>
 </head>
 <body>
