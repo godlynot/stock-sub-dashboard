@@ -1527,11 +1527,59 @@ TEMPLATE = r"""
     font-variant-numeric: tabular-nums;
   }
   .ticker-card .why-post .score-num { color: var(--green); font-weight: 600; }
+  .ticker-card .meta-row {
+    padding-right: 20px;
+    margin-top: 4px;
+    font-size: 11px;
+    color: var(--muted);
+    display: flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .ticker-card .meta-link {
+    color: var(--muted);
+    text-decoration: none;
+    border-bottom: 1px dotted var(--border);
+    transition: color 0.15s, border-color 0.15s;
+  }
+  .ticker-card .meta-link:hover {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+  }
+  .ticker-card .meta-sep { color: var(--border); }
   .watchlist-section { background: linear-gradient(135deg, rgba(210, 153, 34, 0.08), rgba(31, 111, 235, 0.05)); border: 1px solid var(--gold); }
   .watchlist-section h2 { color: var(--gold) !important; }
   .watchlist-empty { color: var(--muted); font-size: 13px; padding: 16px 0; text-align: center; font-style: italic; }
   .sub-section { margin-bottom: 18px; }
-  .sub-section h3 { font-size: 13px; color: var(--accent); margin: 0 0 8px 0; font-weight: 600; }
+  .sub-section h3 {
+    font-size: 13px;
+    color: var(--accent);
+    margin: 0 0 8px 0;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .sub-section .sub-link {
+    color: var(--accent);
+    text-decoration: none;
+    transition: color 0.15s;
+  }
+  .sub-section .sub-link:hover { color: var(--text); }
+  .sub-section .sub-mentions-link {
+    font-size: 10px;
+    color: var(--muted);
+    background: var(--panel-2);
+    padding: 2px 8px;
+    border-radius: 10px;
+    text-decoration: none;
+    font-weight: 600;
+    transition: color 0.15s, background 0.15s;
+  }
+  .sub-section .sub-mentions-link:hover {
+    color: var(--accent);
+    background: var(--panel);
+  }
   .empty { color: var(--muted); font-style: italic; padding: 20px 0; text-align: center; }
   .footer { text-align: center; color: var(--muted); font-size: 11px; padding: 20px; border-top: 1px solid var(--border); margin-top: 30px; }
   .modal { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); display: none; align-items: center; justify-content: center; z-index: 1000; padding: 20px; }
@@ -2543,8 +2591,13 @@ function renderTickerCard(t, opts = {}) {
       <div style="padding-right: 20px;" ${cardClick}>
         ${priceHtml}
       </div>
-      <div style="padding-right: 20px; margin-top: 4px; font-size: 11px; color: var(--muted);" ${cardClick}>
-        ${t.mentions} mentions · ${t.upvotes || 0} ▲
+      <div class="meta-row">
+        <a class="meta-link" href="#" onclick="event.preventDefault(); event.stopPropagation(); openTickerPosts('${t.ticker}')"
+           title="See recent posts mentioning $${escapeHtml(t.ticker)}">
+          ${t.mentions} mentions
+        </a>
+        <span class="meta-sep">·</span>
+        <span title="upvotes">${t.upvotes || 0} ▲</span>
       </div>
       ${whyHtml}
     </div>
@@ -3172,7 +3225,16 @@ function render(d) {
         ? '<div class="empty">No data yet.</div>'
         : Object.keys(d.per_sub_top).sort().map(sub => `
             <div class="sub-section" data-sub="${sub}">
-              <h3>r/${sub}</h3>
+              <h3>
+                <a class="sub-link" href="https://reddit.com/r/${escapeHtml(sub)}" target="_blank" rel="noopener"
+                   title="Open r/${escapeHtml(sub)} on Reddit">
+                  r/${escapeHtml(sub)}
+                </a>
+                <a class="sub-mentions-link" href="#" onclick="event.preventDefault(); openSubPosts('${escapeHtml(sub)}')"
+                   title="See posts that mention tickers in this sub">
+                  posts →
+                </a>
+              </h3>
               <div class="ticker-grid">
                 ${d.per_sub_top[sub].map(t => renderTickerCard(t, {sub: sub})).join('')}
               </div>
@@ -3348,6 +3410,100 @@ function renderTickerDetailHTML(data) {
 
 function closeModal() {
   document.getElementById('modal').classList.remove('active');
+}
+
+function openTickerPosts(ticker) {
+  // Show a modal with all the recent posts/comments mentioning this ticker.
+  // Data comes from dashboardData.ticker_posts (already loaded).
+  const modal = document.getElementById('modal');
+  document.getElementById('modal-body').innerHTML =
+    `<div class="loading">Loading posts for $${escapeHtml(ticker)}...</div>`;
+  modal.classList.add('active');
+  const posts = (dashboardData && dashboardData.ticker_posts && dashboardData.ticker_posts[ticker]) || [];
+  if (posts.length === 0) {
+    document.getElementById('modal-body').innerHTML =
+      `<div class="empty">No recent posts found for $${escapeHtml(ticker)} in our sample.<br>Try the full ticker page for more.</div>
+       <div style="text-align:center;margin-top:12px;">
+         <a href="/ticker/${encodeURIComponent(ticker)}" style="color:var(--accent);">→ Open full $${escapeHtml(ticker)} page</a>
+       </div>`;
+    return;
+  }
+  // Find which sub each post is from
+  const subs = [...new Set(posts.map(p => p.subreddit))].join(', ');
+  let html = `
+    <div class="modal-header-link"><a href="/ticker/${encodeURIComponent(ticker)}" target="_blank">↗ Open full page</a></div>
+    <h2 style="margin-top:0;">$${escapeHtml(ticker)} — ${posts.length} Posts</h2>
+    <div style="color:var(--muted);font-size:12px;margin-bottom:14px;">From: ${escapeHtml(subs)}</div>
+  `;
+  for (const p of posts) {
+    const isComment = p.is_comment;
+    const title = p.title || '';
+    html += `
+      <div class="post">
+        <a class="post-title" href="${p.permalink}" target="_blank" rel="noopener">${escapeHtml(title)}</a>
+        <div class="post-meta">
+          ${isComment ? '💬' : '📝'}
+          r/${escapeHtml(p.subreddit)} ·
+          <span class="score">▲ ${p.score}</span>
+          ${!isComment ? `· 💬 ${p.num_comments || 0}` : ''}
+          ${p.author ? `· <span style="color:var(--muted);">u/${escapeHtml(p.author)}</span>` : ''}
+        </div>
+      </div>
+    `;
+  }
+  document.getElementById('modal-body').innerHTML = html;
+}
+
+async function openSubPosts(sub) {
+  // Show a modal with the recent top posts from a sub that mention any tracked ticker
+  const modal = document.getElementById('modal');
+  document.getElementById('modal-body').innerHTML =
+    `<div class="loading">Loading posts from r/${escapeHtml(sub)}...</div>`;
+  modal.classList.add('active');
+  // Get the posts for this sub from the dashboard data
+  if (!dashboardData || !dashboardData.per_sub_posts) {
+    document.getElementById('modal-body').innerHTML = '<div class="empty">Data not available.</div>';
+    return;
+  }
+  // We need to fetch the actual posts - use ticker_posts index
+  // Filter to posts in this sub
+  const trackedTickers = new Set();
+  if (dashboardData.per_sub_top) {
+    for (const s in dashboardData.per_sub_top) {
+      for (const t of dashboardData.per_sub_top[s] || []) {
+        trackedTickers.add(t.ticker);
+      }
+    }
+  }
+  // Show the recent posts from this sub that we already have
+  const posts = (dashboardData.top_posts || []).filter(p =>
+    p.subreddit === sub && p.title
+  );
+  if (posts.length === 0) {
+    document.getElementById('modal-body').innerHTML =
+      `<div class="empty">No recent tracked posts in r/${escapeHtml(sub)}.</div>`;
+    return;
+  }
+  let html = `<h2 style="margin-top:0;">r/${escapeHtml(sub)} — Recent Tracked Posts</h2>
+    <div style="color:var(--muted);font-size:12px;margin-bottom:14px;">${posts.length} posts from the last hour</div>`;
+  for (const p of posts) {
+    // Find tickers mentioned in title
+    const titleTickers = (p.title || '').match(/\$([A-Z]{1,5})\b/g) || [];
+    html += `
+      <div class="post">
+        <a class="post-title" href="${p.permalink}" target="_blank" rel="noopener">${escapeHtml(p.title)}</a>
+        <div class="post-meta">
+          ${titleTickers.length > 0
+            ? `<span class="sub">${titleTickers.map(t => `<a href="/ticker/${t.replace('$','')}" style="color:var(--accent);text-decoration:none;">${escapeHtml(t)}</a>`).join(' ')}</span> · `
+            : ''}
+          <span class="score">▲ ${p.score}</span>
+          · 💬 ${p.num_comments || 0}
+          · <span style="color:var(--muted);">u/${escapeHtml(p.author || '')}</span>
+        </div>
+      </div>
+    `;
+  }
+  document.getElementById('modal-body').innerHTML = html;
 }
 
 loadData();
