@@ -1384,12 +1384,18 @@ TEMPLATE = r"""
   @media (min-width: 720px) { .grid { grid-template-columns: 1fr 1fr; } .grid-full { grid-column: 1 / -1; } }
   .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
   .card h2 {
-    font-size: 14px;
-    text-transform: uppercase;
-    letter-spacing: 0.6px;
-    color: var(--muted);
+    font-size: 18px;
+    text-transform: none;
+    letter-spacing: -0.3px;
+    color: var(--text);
     margin: 0 0 14px 0;
-    font-weight: 700;
+    font-weight: 600;
+  }
+  .header-sub {
+    font-size: 13px;
+    color: var(--muted);
+    font-weight: 400;
+    margin-left: 4px;
   }
   .row { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--border); gap: 10px; }
   .row:last-child { border-bottom: none; }
@@ -1430,9 +1436,8 @@ TEMPLATE = r"""
   .ticker-card.up::before { background: var(--green); opacity: 0.8; }
   .ticker-card.down::before { background: var(--red); opacity: 0.8; }
   .ticker-card:hover {
-    border-color: var(--accent);
-    transform: translateY(-2px);
-    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+    border-color: var(--muted);
+    background: var(--panel);
   }
   .ticker-card .sym {
     font-weight: 700;
@@ -1539,16 +1544,13 @@ TEMPLATE = r"""
   .ticker-card .meta-link {
     color: var(--muted);
     text-decoration: none;
-    border-bottom: 1px dotted var(--border);
-    transition: color 0.15s, border-color 0.15s;
+    transition: color 0.15s;
   }
   .ticker-card .meta-link:hover {
     color: var(--accent);
-    border-bottom-color: var(--accent);
   }
   .ticker-card .meta-sep { color: var(--border); }
-  .watchlist-section { background: linear-gradient(135deg, rgba(210, 153, 34, 0.08), rgba(31, 111, 235, 0.05)); border: 1px solid var(--gold); }
-  .watchlist-section h2 { color: var(--gold) !important; }
+  .watchlist-section { background: var(--panel); }
   .watchlist-empty { color: var(--muted); font-size: 13px; padding: 16px 0; text-align: center; font-style: italic; }
   .sub-section { margin-bottom: 18px; }
   .sub-section h3 {
@@ -1866,33 +1868,15 @@ TEMPLATE = r"""
 
   /* ----- Watchlist performance summary ----- */
   .watchlist-summary {
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 8px;
-    margin: 8px 0 14px;
-    padding: 10px;
+    margin: 0 0 14px 0;
+    padding: 12px 14px;
     background: var(--panel-2);
     border-radius: 6px;
-  }
-  @media (max-width: 600px) {
-    .watchlist-summary { grid-template-columns: repeat(2, 1fr); }
-  }
-  .ws-stat { text-align: center; }
-  .ws-stat .ws-label {
-    font-size: 10px;
-    color: var(--muted);
-    text-transform: uppercase;
-    letter-spacing: 0.3px;
-    margin-bottom: 2px;
-  }
-  .ws-stat .ws-value {
     font-size: 14px;
-    font-weight: 600;
-    font-variant-numeric: tabular-nums;
+    line-height: 1.5;
   }
-  .ws-stat .ws-value.positive { color: var(--green); }
-  .ws-stat .ws-value.negative { color: var(--red); }
-  .ws-stat .ws-value.neutral { color: var(--text); }
+  .watchlist-summary .positive { color: var(--green); font-weight: 600; }
+  .watchlist-summary .negative { color: var(--red); font-weight: 600; }
 
   /* ----- Watchlist news ----- */
   .watchlist-news-area { margin-top: 16px; }
@@ -1982,8 +1966,8 @@ TEMPLATE = r"""
     box-shadow: 0 1px 3px rgba(0,0,0,0.2);
   }
   .heatmap-cell:hover {
-    transform: scale(1.1) translateY(-2px);
-    box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+    transform: scale(1.05);
+    box-shadow: 0 4px 16px rgba(0,0,0,0.4);
     z-index: 1;
   }
   .heatmap-cell .heatmap-sym {
@@ -2770,13 +2754,14 @@ function renderTodaysMoves(d) {
 
 function renderSectionNav() {
   // Build a sticky nav with anchors to each major section
+  // Use plain text labels (not emoji) - less AI, more human
   const sections = [
-    {id: 'sec-macro', label: '📊 Macro'},
-    {id: 'sec-heatmap', label: '🔥 Heatmap'},
-    {id: 'sec-earnings', label: '📅 Earnings'},
-    {id: 'sec-watchlist', label: '⭐ Watchlist'},
-    {id: 'sec-trending', label: '🔥 Trending'},
-    {id: 'sec-leaderboard', label: '🏆 Leaders'},
+    {id: 'sec-macro', label: 'Macro'},
+    {id: 'sec-heatmap', label: 'Heatmap'},
+    {id: 'sec-earnings', label: 'Earnings'},
+    {id: 'sec-watchlist', label: 'Watchlist'},
+    {id: 'sec-trending', label: 'Trending'},
+    {id: 'sec-leaderboard', label: 'Leaders'},
   ];
   return `<nav class="section-nav">${sections.map(s =>
     `<button onclick="document.getElementById('${s.id}').scrollIntoView({behavior:'smooth',block:'start'})">${s.label}</button>`
@@ -2935,9 +2920,9 @@ function renderWatchlistSection() {
   if (watchlist.length === 0) {
     return `
       <div class="card watchlist-section">
-        <h2>⭐ My Watchlist</h2>
+        <h2>My watchlist</h2>
         <div class="watchlist-empty">
-          Tap the ☆ on any ticker to add it here. Your watchlist is saved on this device only.
+          Tap the star on any ticker to add it here. Your watchlist is saved on this device only.
         </div>
       </div>
     `;
@@ -2967,7 +2952,7 @@ function renderWatchlistSection() {
   const performance = renderWatchlistPerformance(watchlist, prices);
   return `
     <div class="card watchlist-section">
-      <h2>⭐ My Watchlist (${watchlist.length})</h2>
+      <h2>My watchlist <span class="header-sub">${watchlist.length} ticker${watchlist.length === 1 ? '' : 's'}</span></h2>
       ${performance}
       <div class="ticker-grid">
         ${cards.join('')}
@@ -2979,6 +2964,7 @@ function renderWatchlistSection() {
 
 function renderWatchlistPerformance(watchlist, prices) {
   // Aggregate: average change %, best, worst, count
+  // Render as a sentence instead of stat blocks - feels more human
   const valid = watchlist.filter(t => prices[t] && prices[t].price);
   if (valid.length === 0) return '';
   const changes = valid.map(t => prices[t].change_pct || 0);
@@ -2990,27 +2976,12 @@ function renderWatchlistPerformance(watchlist, prices) {
   const bestChange = prices[best].change_pct;
   const worstChange = prices[worst].change_pct;
   const avgClass = avg >= 0 ? 'positive' : 'negative';
-  const avgStr = avg >= 0 ? `+${avg.toFixed(2)}%` : `${avg.toFixed(2)}%`;
-  return `
-    <div class="watchlist-summary">
-      <div class="ws-stat">
-        <div class="ws-label">Your list today</div>
-        <div class="ws-value ${avgClass}">${avgStr}</div>
-      </div>
-      <div class="ws-stat">
-        <div class="ws-label">Best</div>
-        <div class="ws-value positive">$${best} +${bestChange.toFixed(2)}%</div>
-      </div>
-      <div class="ws-stat">
-        <div class="ws-label">Worst</div>
-        <div class="ws-value negative">$${worst} ${worstChange.toFixed(2)}%</div>
-      </div>
-      <div class="ws-stat">
-        <div class="ws-label">Tickers</div>
-        <div class="ws-value neutral">${valid.length} of ${watchlist.length}</div>
-      </div>
-    </div>
-  `;
+  const avgSign = avg >= 0 ? '+' : '';
+  return `<div class="watchlist-summary">
+    Today your watchlist is <span class="${avgClass}">${avgSign}${avg.toFixed(2)}%</span> on average.
+    Best: <span class="positive">$${best} ${bestChange >= 0 ? '+' : ''}${bestChange.toFixed(2)}%</span>,
+    worst: <span class="negative">$${worst} ${worstChange.toFixed(2)}%</span>.
+  </div>`;
 }
 
 let _watchlistNews = {};  // cached news data per ticker (for the watchlist)
@@ -3148,7 +3119,7 @@ function render(d) {
     ${renderSectionNav()}
     <div id="sec-macro" class="card collapsible">
       <div class="card-header" onclick="toggleCollapse(this)">
-        <h2>📊 Market Overview</h2>
+        <h2>Market overview</h2>
         <span class="collapse-toggle">▼</span>
       </div>
       <div class="card-body">
@@ -3157,7 +3128,7 @@ function render(d) {
     </div>
     <div id="sec-heatmap" class="card collapsible">
       <div class="card-header" onclick="toggleCollapse(this)">
-        <h2>🔥 Market Heatmap</h2>
+        <h2>Heatmap</h2>
         <span class="collapse-toggle">▼</span>
       </div>
       <div class="card-body">
@@ -3166,7 +3137,7 @@ function render(d) {
     </div>
     <div id="sec-earnings" class="card collapsible">
       <div class="card-header" onclick="toggleCollapse(this)">
-        <h2>📅 Upcoming Earnings <span style="font-size:11px;font-weight:normal;color:var(--muted);text-transform:none;letter-spacing:0;">— sorted by Reddit buzz</span></h2>
+        <h2>Upcoming earnings <span class="header-sub">sorted by Reddit buzz</span></h2>
         <span class="collapse-toggle">▼</span>
       </div>
       <div class="card-body">
@@ -3178,7 +3149,7 @@ function render(d) {
     </div>
 
     <div class="card">
-      <h2>🔥 Trending (mentions Δ vs 24h)</h2>
+      <h2>Trending <span class="header-sub">mentions Δ vs 24h</span></h2>
       ${d.trending.length === 0
         ? '<div class="empty">No trending data yet.</div>'
         : d.trending.slice(0, 12).map(t => `
@@ -3201,7 +3172,7 @@ function render(d) {
     </div>
 
     <div class="card">
-      <h2>🏆 Cross-Sub Leaderboard</h2>
+      <h2>Cross-sub leaderboard</h2>
       ${d.cross_sub_leaderboard.length === 0
         ? '<div class="empty">No data yet.</div>'
         : d.cross_sub_leaderboard.slice(0, 12).map(t => `
@@ -3220,7 +3191,7 @@ function render(d) {
     </div>
 
     <div class="card grid-full">
-      <h2>📊 Per-Subreddit Top Tickers</h2>
+      <h2>By subreddit</h2>
       ${Object.keys(d.per_sub_top).length === 0
         ? '<div class="empty">No data yet.</div>'
         : Object.keys(d.per_sub_top).sort().map(sub => `
@@ -3244,7 +3215,7 @@ function render(d) {
     </div>
 
     <div class="card grid-full">
-      <h2>🌟 Top Recent Posts</h2>
+      <h2>Top recent posts</h2>
       ${d.top_posts.length === 0
         ? '<div class="empty">No posts yet.</div>'
         : d.top_posts.slice(0, 20).map(p => `
@@ -3264,7 +3235,7 @@ function render(d) {
     </div>
 
     <div class="card">
-      <h2>💬 Sub Activity</h2>
+      <h2>Sub activity</h2>
       ${d.per_sub_posts.length === 0
         ? '<div class="empty">No posts yet.</div>'
         : d.per_sub_posts.map(s => `
