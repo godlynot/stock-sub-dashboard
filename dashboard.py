@@ -1608,6 +1608,24 @@ TEMPLATE = r"""
   }
   .ticker-card .star:hover { color: var(--gold); transform: scale(1.2); }
   .ticker-card .star.starred { color: var(--gold); }
+
+  /* ----- Portfolio button ----- */
+  .portfolio-btn {
+    position: absolute;
+    top: 8px;
+    right: 36px;
+    color: var(--muted);
+    font-size: 14px;
+    font-weight: 700;
+    line-height: 1;
+    cursor: pointer;
+    user-select: none;
+    transition: color 0.15s, transform 0.15s;
+    padding: 2px 6px;
+    border-radius: 3px;
+  }
+  .ticker-card .portfolio-btn:hover { color: var(--gold); transform: scale(1.15); }
+  .ticker-card .portfolio-btn.in-portfolio { color: var(--gold); }
   .ticker-card .no-price { color: var(--muted); font-size: 11px; margin-top: 6px; font-style: italic; }
   .ticker-card .why-trending {
     margin-top: 8px;
@@ -2121,7 +2139,28 @@ TEMPLATE = r"""
   .filing-time { color: var(--muted); }
   .filing-type { color: var(--muted); font-size: 9px; text-transform: uppercase; letter-spacing: 0.3px; }
 
-  /* ----- Heatmap ----- */
+  /* ----- Portfolio section ----- */
+  .portfolio-section { background: var(--panel); }
+  .portfolio-empty { color: var(--muted); font-size: 13px; padding: 16px 0; text-align: center; font-style: italic; }
+  .portfolio-summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
+  .port-stat { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 14px; text-align: center; }
+  .port-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; font-weight: 600; }
+  .port-value { font-size: 18px; font-weight: 700; color: var(--text); font-variant-numeric: tabular-nums; }
+  .port-value.positive { color: var(--green); }
+  .port-value.negative { color: var(--red); }
+  .port-value.neutral { color: var(--accent); font-size: 16px; }
+  .portfolio-table { overflow-x: auto; }
+  .portfolio-header { display: grid; grid-template-columns: 2fr 1fr 1fr 1fr 1fr 1fr 1fr; gap: 8px; padding: 8px 12px; background: var(--panel-2); border-radius: 6px; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
+  .portfolio-rows { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+  .portfolio-row { display: grid; grid-template-columns: 2fr 1fr 1fr 1fr 1fr 1fr 1fr; gap: 8px; padding: 10px 12px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; font-size: 12px; align-items: center; }
+  .pos-info { display: flex; flex-direction: column; gap: 2px; }
+  .pos-ticker { font-weight: 700; color: var(--accent); font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .pos-name { font-size: 10px; color: var(--muted); max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pos-shares, .pos-cost, .pos-current, .pos-change, .pos-value, .pos-pnl { font-variant-numeric: tabular-nums; text-align: right; font-size: 12px; }
+  .pos-cost { color: var(--muted); font-size: 11px; }
+  .pos-change.positive, .pos-pnl.positive { color: var(--green); }
+  .pos-change.negative, .pos-pnl.negative { color: var(--red); }
+  .pos-pnl { font-weight: 600; }
   .heatmap-grid {
     display: flex;
     flex-wrap: wrap;
@@ -2745,12 +2784,19 @@ function renderTickerCard(t, opts = {}) {
   let dirClass = '';
   if (p && p.change_pct > 0.05) dirClass = 'up';
   else if (p && p.change_pct < -0.05) dirClass = 'down';
+  const portfolio = getPortfolio();
+  const inPortfolio = portfolio[t.ticker] ? true : false;
   return `
     <div class="ticker-card ${dirClass}" data-ticker="${t.ticker}" data-sub="${opts.sub || ''}" data-name="${escapeHtml(t.name || '')}">
       <span class="star ${isStarred ? 'starred' : ''}" data-ticker="${t.ticker}"
             onclick="event.stopPropagation(); toggleStar('${t.ticker}')"
             title="${isStarred ? 'Remove from watchlist' : 'Add to watchlist'}">
         ${isStarred ? '★' : '☆'}
+      </span>
+      <span class="portfolio-btn ${inPortfolio ? 'in-portfolio' : ''}" data-ticker="${t.ticker}"
+            onclick="event.stopPropagation(); ${inPortfolio ? `removeFromPortfolio('${t.ticker}')` : `promptAddToPortfolio('${t.ticker}')`}"
+            title="${inPortfolio ? 'Remove from portfolio' : 'Add to portfolio'}">
+        $
       </span>
       <div style="padding-right: 20px;" ${cardClick}>
         <div class="sym">$${t.ticker}${earningsBadge}</div>
@@ -2814,7 +2860,54 @@ function toggleStar(ticker) {
   }
 }
 
-// ----- Macro strip -----
+// ----- Portfolio (localStorage) -----
+
+const PORTFOLIO_KEY = 'stock-sub-portfolio-v1';
+
+function getPortfolio() {
+  try {
+    return JSON.parse(localStorage.getItem('stock-sub-portfolio-v1') || '{}');
+  } catch { return {}; }
+}
+
+function savePortfolio(portfolio) {
+  localStorage.setItem('stock-sub-portfolio-v1', JSON.stringify(portfolio));
+}
+
+function addToPortfolio(ticker, shares, costBasis, name) {
+  const portfolio = getPortfolio();
+  portfolio[ticker] = { shares: parseFloat(shares), costBasis: parseFloat(costBasis), name };
+  localStorage.setItem('stock-sub-portfolio-v1', JSON.stringify(portfolio));
+  loadData(false); // refresh UI
+}
+
+function removeFromPortfolio(ticker) {
+  const portfolio = getPortfolio();
+  delete portfolio[ticker];
+  localStorage.setItem('stock-sub-portfolio-v1', JSON.stringify(portfolio));
+  loadData(false);
+}
+
+function promptAddToPortfolio(ticker) {
+  const portfolio = getPortfolio();
+  const existing = portfolio[ticker];
+  if (existing) {
+    // Already in portfolio, don't prompt (handled by remove button)
+    return;
+  }
+  // Get the name from the card
+  const card = document.querySelector(`.ticker-card[data-ticker="${ticker}"]`);
+  const name = card ? (card.dataset.name || '') : '';
+  
+  // Use a simple prompt for shares and cost basis
+  const shares = prompt(`Add $${ticker} to portfolio:\nShares:`, '');
+  if (!shares || isNaN(parseFloat(shares)) || parseFloat(shares) <= 0) return;
+  
+  const costBasis = prompt(`Add $${ticker} to portfolio:\nCost basis per share ($):`, '');
+  if (!costBasis || isNaN(parseFloat(costBasis)) || parseFloat(costBasis) <= 0) return;
+  
+  addToPortfolio(ticker, shares, costBasis, name);
+}
 
 function formatMacroValue(key, value) {
   // Different formatting for different series
