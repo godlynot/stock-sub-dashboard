@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import requests
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, jsonify, render_template_string, request, send_file
 
 # ----------------------------------------------------------------------------
 # Config
@@ -1449,6 +1449,8 @@ TEMPLATE = r"""
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Stock Sub Dashboard</title>
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#1f6feb">
 <style>
   :root {
     --bg: #0d1117;
@@ -3860,6 +3862,15 @@ async function openSubPosts(sub) {
 }
 
 loadData();
+
+// Register service worker for PWA
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/service-worker.js')
+      .then(reg => console.log('Service Worker registered:', reg.scope))
+      .catch(err => console.log('Service Worker registration failed:', err));
+  });
+}
 </script>
 </body>
 </html>
@@ -3869,6 +3880,22 @@ loadData();
 @app.route("/")
 def index():
     return render_template_string(TEMPLATE)
+
+
+import os
+
+# Project directory for static files
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+@app.route("/manifest.json")
+def manifest():
+    return send_file(os.path.join(BASE_DIR, "manifest.json"), mimetype="application/manifest+json")
+
+
+@app.route("/service-worker.js")
+def service_worker():
+    return send_file(os.path.join(BASE_DIR, "service-worker.js"), mimetype="application/javascript")
 
 
 # ----------------------------------------------------------------------------
